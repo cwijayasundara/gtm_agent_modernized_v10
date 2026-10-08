@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Generated artifacts (drafts, briefings, usage ledgers)
+out/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.DS_Store

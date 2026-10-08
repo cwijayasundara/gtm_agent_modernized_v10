@@ -1,0 +1,67 @@
+{
+  "_meta": "Overlay for the GTM agent. Merged over decision_harness defaults. GLM-5.3-flash is already the default fast-tier primary (id accounts/fireworks/routers/glm-5p3-fast, alias 'glm-5.3-flash'). ALL PRICES ARE PLACEHOLDERS - verify against provider pricing pages before production.",
+  "models": [
+    {
+      "id": "accounts/fireworks/models/deepseek-4-flash",
+      "provider": "fireworks",
+      "tier": "fast",
+      "chat_provider": "openai",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "api_key_env": "FIREWORKS_API_KEY",
+      "input_price": 0.06,
+      "output_price": 0.24,
+      "context_window": 163840,
+      "max_output_tokens": 32768,
+      "capabilities": ["tools", "json"],
+      "intelligence": 7.4,
+      "aliases": ["deepseek-4-flash"],
+      "notes": "PLACEHOLDER pricing. Fireworks fast alternate; kept just above GLM-5.3-flash so GLM stays the fast primary."
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "provider": "anthropic",
+      "tier": "balanced",
+      "chat_provider": "anthropic",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "input_price": 1.0,
+      "output_price": 5.0,
+      "context_window": 200000,
+      "max_output_tokens": 64000,
+      "capabilities": ["tools", "vision", "json"],
+      "intelligence": 8.4,
+      "aliases": ["claude-haiku-5-5"],
+      "notes": "PLACEHOLDER pricing. Balanced primary: cheapest-per-second capable model; slower/higher tiers escalate above it when their keys are configured."
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "provider": "anthropic",
+      "tier": "performance",
+      "chat_provider": "anthropic",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "reasoning_effort": "low",
+      "input_price": 3.0,
+      "output_price": 15.0,
+      "context_window": 200000,
+      "capabilities": ["tools", "vision", "json", "reasoning"],
+      "intelligence": 9.1,
+      "aliases": ["claude-sonnet-4-6"],
+      "notes": "PLACEHOLDER pricing. Performance ceiling for the GTM agent; effort pinned to low — orchestration doesn't need deep reasoning."
+    },
+    {
+      "id": "gpt-6-luna",
+      "provider": "openai",
+      "tier": "balanced",
+      "chat_provider": "openai",
+      "api_key_env": "OPENAI_API_KEY",
+      "reasoning_effort": "medium",
+      "input_price": 0.75,
+      "output_price": 5.0,
+      "context_window": 272000,
+      "max_output_tokens": 128000,
+      "capabilities": ["tools", "vision", "json", "reasoning"],
+      "intelligence": 8.8,
+      "aliases": ["gpt-6-luna"],
+      "notes": "PLACEHOLDER pricing. Balanced primary for the GTM agent; also the Decisions-API classifier model."
+    }
+  ]
+}
