@@ -100,11 +100,9 @@ class GTMAgentRunner:
             extra: list[Any] = []
             prompt = None
             if self.interpreter:
-                from langchain_quickjs import CodeInterpreterMiddleware
+                from gtm_agent.agent import GTM_INTERPRETER_SYSTEM_PROMPT, interpreter_middleware
 
-                from gtm_agent.agent import DEFAULT_INTERPRETER_PTC, GTM_INTERPRETER_SYSTEM_PROMPT
-
-                extra = [CodeInterpreterMiddleware(ptc=DEFAULT_INTERPRETER_PTC)]
+                extra = [interpreter_middleware()]
                 prompt = GTM_INTERPRETER_SYSTEM_PROMPT
             if self.selector:
                 from langchain.agents.middleware import LLMToolSelectorMiddleware
@@ -327,6 +325,7 @@ class GTMAgentTestRunner:
     def __init__(self, verbose: bool = False) -> None:
         self.verbose = verbose
         self.results: list[tuple[str, bool, str]] = []
+        self.skipped: list[tuple[str, str]] = []
 
     def test_tool_universe(self) -> None:
         """The agent simulates a 50-tool stack; nothing leaks before a skill is read."""
@@ -533,6 +532,10 @@ class GTMAgentTestRunner:
                 return set(line.split(":", 1)[1].split())
         raise AssertionError(f"no include_tools in skills/{skill}/SKILL.md")
 
+    def _record_skipped(self, name: str, detail: str) -> None:
+        self.skipped.append((name, detail))
+        print(f"  ⏭ {name:20s} skipped — {detail}")
+
     def _record(self, name: str, passed: bool, detail: str) -> None:
         self.results.append((name, passed, detail))
         mark = "✅" if passed else "❌"
@@ -556,11 +559,14 @@ class GTMAgentTestRunner:
         ]:
             try:
                 scenario()
+            except ImportError as exc:  # optional extra missing (e.g. QuickJS)
+                self._record_skipped(scenario.__name__.removeprefix("test_"), str(exc).splitlines()[0])
             except AssertionError as exc:
                 self._record(scenario.__name__, False, str(exc)[:120])
         print("=" * 64)
         passed = sum(1 for _, ok, _ in self.results if ok)
-        print(f"{passed}/{len(self.results)} scenarios passed\n")
+        suffix = f" ({len(self.skipped)} skipped: optional extra not installed)" if self.skipped else ""
+        print(f"{passed}/{len(self.results)} scenarios passed{suffix}\n")
         return 0 if passed == len(self.results) else 1
 
 

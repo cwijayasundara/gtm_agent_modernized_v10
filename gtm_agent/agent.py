@@ -36,7 +36,6 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
 from langchain.agents.middleware import LLMToolSelectorMiddleware
-from langchain_quickjs import CodeInterpreterMiddleware
 
 from . import tools
 
@@ -118,6 +117,25 @@ def _make_model(model: BaseChatModel | None = None) -> BaseChatModel:
     return model or ChatAnthropic(model=model_id, max_tokens=8000)
 
 
+def interpreter_middleware(ptc: list[str] | None = None) -> Any:
+    """Build the code-interpreter middleware (imported lazily: optional extra).
+
+    Raises:
+        ImportError: with install instructions when the QuickJS runtime is absent.
+    """
+    try:
+        from langchain_quickjs import CodeInterpreterMiddleware
+    except ImportError as exc:  # pragma: no cover - depends on optional extra
+        raise ImportError(
+            "The interpreter needs the optional QuickJS runtime. Install it with:\n"
+            '    uv pip install -e ".[interpreter]"\n'
+            "or: uv pip install \"deepagents[quickjs]\""
+        ) from exc
+    return CodeInterpreterMiddleware(
+        ptc=ptc if ptc is not None else DEFAULT_INTERPRETER_PTC
+    )
+
+
 def build_agent(model: BaseChatModel | None = None):
     """Build the GTM deep agent with skills-backed tool binding."""
     return create_deep_agent(
@@ -163,11 +181,7 @@ def build_interpreter_agent(
         system_prompt=system_prompt or GTM_INTERPRETER_SYSTEM_PROMPT,
         skills=skills or ["/skills/"],
         backend=backend or FilesystemBackend(root_dir=PROJECT_ROOT),
-        middleware=[
-            CodeInterpreterMiddleware(
-                ptc=ptc if ptc is not None else DEFAULT_INTERPRETER_PTC
-            )
-        ],
+        middleware=[interpreter_middleware(ptc)],
     )
 
 
