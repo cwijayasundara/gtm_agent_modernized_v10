@@ -83,6 +83,9 @@ gtm_agent_modernized_v1.0/
 ├── gtm_agent/
 │   ├── agent.py        # create_deep_agent + Claude Haiku 5.5 + skills
 │   ├── tools.py        # 50-tool simulated stack: 47 DEFERRED + 3 always-on
+│   ├── simulator.py    # offline LLM: scripted deepagents runs + data-driven GTM simulator
+│   ├── routing.py      # decision_harness model-selection middleware + telemetry
+│   ├── direct.py       # defined tool invocation workflows (no agent loop)
 │   └── demo.py         # simple runnable inbound-lead demo
 ├── skills/
 │   ├── outbound-followup/SKILL.md      # binds 12 tools via include_tools
@@ -90,11 +93,19 @@ gtm_agent_modernized_v1.0/
 │   ├── customer-health/SKILL.md        # binds 12 tools via include_tools
 │   ├── meeting-prep/SKILL.md           # binds 8 tools via include_tools
 │   └── competitor-analysis/SKILL.md    # methodology-only (binds none)
-└── tests/smoke_test_skill_tools.py     # minimal binding proof, no API key
+└── tests/              # offline smoke tests (no API key needed)
+    ├── smoke_test_skill_tools.py        # skills/deferred-disclosure binding proof
+    ├── smoke_test_defined_invocation.py # defined (no-loop) tool invocation workflows
+    └── smoke_test_interpreter_ptc.py   # interpreter PTC: eval -> allowlisted tool
 ```
 
 - **Model**: `claude-haiku-5-5` via `langchain_anthropic.ChatAnthropic`
 - **Harness**: `create_deep_agent(model, tools, skills=["/skills/"], backend=FilesystemBackend(root_dir=<project>))`
+- **Invocations**: defined workflows (`python main.py direct …` →
+  `gtm_agent/direct.py`), code interpreter (`python main.py --interpreter …` →
+  `build_interpreter_agent` / `CodeInterpreterMiddleware`), LLM tool selection
+  (`python main.py --selector …` → `build_tool_selector_agent` /
+  `LLMToolSelectorMiddleware`).`
 - **Data sources** (Salesforce, Gong, Exa, BigQuery, Slack) are mocked
   in-memory fixtures — no external credentials needed except
   `ANTHROPIC_API_KEY` for the live demo.
@@ -132,14 +143,24 @@ cp .env.example .env           # then fill in ANTHROPIC_API_KEY
 # 2. Minimal binding proof (no API key needed)
 .venv/bin/python tests/smoke_test_skill_tools.py
 
-# 3. Full scenario test suite — meaningful, rule-based, no API key needed
+# 3. Interpreter proof (model-authored JS -> allowlisted tools -> result)
+.venv/bin/python tests/smoke_test_interpreter_ptc.py
+
+# 4. Defined-invocation proof (playbook tools invoked directly, no agent loop)
+.venv/bin/python tests/smoke_test_defined_invocation.py
+
+# 5. Full scenario test suite — meaningful, rule-based, no API key needed
 .venv/bin/python main.py test   # add -v for per-model-call disclosure snapshots
 #   ✅ tool universe     50 tools (47 deferred, 3 always-on); run disclosed only its skill's tools
 #   ✅ do-not-send gate  SEV-2 lead → check runs first, nothing drafted
 #   ✅ outbound playbook check → research → draft, queued as pending_approval
 #   ✅ skill isolation   intel run never sees outbound tools
+#   ✅ model routing     query classified once, sticky per thread, ledger entries
+#   ✅ defined invocation no agent loop: gates enforced, drafts queued, intel + prep produced
+#   ✅ interpreter PTC   1 eval per workflow; same gates + identical draft as the loop playbook
+#   ✅ tool selector     LLM selector narrows the toolset before the loop runs
 
-# 4. Do something useful: run the agent's actual GTM workflows (offline simulator)
+# 6. Do something useful: run the agent's actual GTM workflows (offline simulator)
 .venv/bin/python main.py                        # a full simulated day: 3 leads + briefing + prep + inbox
 .venv/bin/python main.py lead lead-1042         # process one inbound lead
 .venv/bin/python main.py briefing Helix Health  # account-intelligence briefing
@@ -148,10 +169,24 @@ cp .env.example .env           # then fill in ANTHROPIC_API_KEY
 # → artifacts (drafts, briefings, preps) land in out/; nothing ever sends
 #   without rep approval — the human-in-the-loop step.
 
-# 5. Same workflows on the real model (needs ANTHROPIC_API_KEY in .env)
+# 7. Same workflows on the real model (needs ANTHROPIC_API_KEY in .env)
 .venv/bin/python main.py --live lead lead-1042
 .venv/bin/python main.py --live briefing Helix Health
 ```
+
+# 8. Invoke GTM tools in a defined way — no agent loop, no LLM in the loop (offline)
+python main.py direct lead lead-1042        # outbound: gates → research → draft → queue
+python main.py direct intel "Helix Health" # account briefing
+python main.py direct prep "Priya Sharma"  # meeting prep
+
+# 9. Programmatic tool calling: one model-authored eval program per workflow
+.venv/bin/python main.py --interpreter lead lead-1042
+.venv/bin/python main.py --interpreter briefing Helix Health
+.venv/bin/python main.py --interpreter prep "Priya Sharma"
+.venv/bin/python main.py --route --interpreter lead lead-1042   # routing + PTC compose
+
+# 10. LLM tool selection: narrow the toolset before the agent loop
+.venv/bin/python main.py --selector lead lead-1042
 
 Example live prompts:
 
@@ -189,6 +224,98 @@ python main.py route "Review our renewal strategy for a churn-risk account"  # �
 python main.py --route --live lead lead-1042   # routed live run + usage report
 python main.py --route                          # routed simulated day + report
 ```
+
+## Invoking tools without the agent loop (defined workflows + interpreter)
+
+The skills binding solves *tool discovery* (deferred schemas are disclosed
+only after the right `SKILL.md` is read). But the sample goes further: the
+GTM tools can also be invoked **in a defined way** instead of going through the
+agent loop where the model has to decide which tool to use next.
+
+Three shapes ship in this repo:
+
+### 1. Deterministic workflows — `gtm_agent/direct.py`, CLI `python main.py direct …`
+
+The playbook steps are authored in code; the mocked tools are invoked directly,
+in the defined order, with the same gates the agent loop enforces.
+**No LLM in the loop; no model deciding anything.**
+
+```bash
+python main.py direct lead lead-1042        # outbound: gates -> research -> draft -> queue
+python main.py direct intel "Helix Health" # account briefing
+python main.py direct prep "Priya Sharma"  # meeting prep
+```
+
+### 2. Code interpreter — `build_interpreter_agent()` (programmatic tool calling)
+
+[LangChain deep-agents "Give Your Agents an Interpreter"](https://www.langchain.com/blog/give-your-agents-an-interpreter):
+the agent gets a `CodeInterpreterMiddleware` and the model authors JS against
+an allowlisted `tools` namespace.
+
+```python
+from gtm_agent.agent import DEFAULT_INTERPRETER_PTC, build_interpreter_agent
+
+agent = build_interpreter_agent()  # CodeInterpreterMiddleware(ptc=DEFAULT_INTERPRETER_PTC)
+# model-authored JS:
+#   const r = await tools.lookupLead({ lead_id: "lead-1042" }); r;
+```
+
+For the outbound workflow that whole playbook collapses into **one** eval program
+(`gtm_agent/simulator.py` holds the JS the scripted model authors):
+
+```javascript
+const history = JSON.parse(await tools.checkContactHistory({ lead_id: leadId }));
+if (history.do_not_send) return { outcome: "blocked", reason: history.summary };
+const lead = JSON.parse(await tools.lookupLead({ lead_id: leadId }));
+const [research, gong] = await Promise.all([
+  tools.webSearchCompany({ company: lead.company }),
+  tools.getGongTranscripts({ lead_id: leadId }),
+]);
+await tools.draftSlackFollowup({ lead_id: leadId, draft, rationale });
+```
+
+Measured offline, with the same gates as the loop version:
+
+| Run | Model turns | Tool-call turns |
+|---|---|---|
+| loop (unpinned) | 6 | 5 (`read_file`, 4 tool calls) |
+| loop (pinned skill) | 5 | 4 |
+| interpreter (pinned skill) | 2 | 1 (`eval`) |
+
+The interpreter's tool trace for a full outbound run is literally
+`eval` — one round trip, all five tool invocations composed in code. The
+draft it queues is byte-identical to the loop version's (asserted in the test
+suite), so the cheaper execution path doesn't change the outcome.
+
+### 3. LLM tool selector — `build_tool_selector_agent()` (`LLMToolSelectorMiddleware`)
+
+The full GTM toolset is narrowed by an LLM before the agent loop starts with
+`langchain.agents.middleware.LLMToolSelectorMiddleware`.
+
+```python
+from gtm_agent.agent import build_tool_selector_agent
+
+agent = build_tool_selector_agent(max_tools=3)  # LLM picks the relevant tools
+```
+
+Offline, the selector sees the whole 50-tool catalog and the agent loop then
+binds only the chosen names — 4 for the outbound playbook, 3 for intel — so the
+loop's decision space shrinks before the first turn (the test asserts 50 → 1
+when a one-tool selection is scripted).
+
+### Composing them
+
+`--route` (routing middleware), `--interpreter` (PTC) and `--selector` are
+independent flags and compose. All three together run routed, with only the
+selected tools bound, and the workflow as a single `eval` program:
+
+```bash
+.venv/bin/python main.py --route --interpreter --selector lead lead-1042
+# tools bound: 1 (eval) | tool trace: eval | routing: gpt-6-luna (sticky)
+```
+
+Composition happens through
+`build_routed_agent(..., extra_middleware=[CodeInterpreterMiddleware(...), LLMToolSelectorMiddleware(...)])`.
 
 ## Ideas to take it further
 

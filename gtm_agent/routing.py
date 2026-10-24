@@ -297,11 +297,15 @@ def build_routed_agent(
     *,
     use_decisions: bool | None = None,
     models_override: dict[str, Any] | None = None,
+    extra_middleware: list[Any] | None = None,
+    system_prompt: str | None = None,
 ):
     """GTM deep agent whose model is chosen per query (sticky per thread).
 
     models_override maps catalog labels (`provider/id`) to chat model
     instances — how offline runs inject the scripted fake for every tier.
+    extra_middleware composes additional middleware (e.g. the code
+    interpreter's ``CodeInterpreterMiddleware``) after the routing layer.
     """
     from decision_harness.middleware.model_selection import ModelSelectionMiddleware
 
@@ -333,11 +337,11 @@ def build_routed_agent(
         # Nominal model; every call is swapped by the routing middleware.
         model=nominal,
         tools=tools.ALL_TOOLS,
-        system_prompt=GTM_SYSTEM_PROMPT,
+        system_prompt=system_prompt or GTM_SYSTEM_PROMPT,
         skills=["/skills/"],
         backend=FilesystemBackend(root_dir=PROJECT_ROOT),
         # Telemetry outermost: measures the full per-call time incl. retries.
-        middleware=[telemetry.calls_middleware, middleware],
+        middleware=[telemetry.calls_middleware, middleware, *(extra_middleware or [])],
     )
     return agent
 

@@ -114,6 +114,83 @@ BigQuery, Zendesk, Slack) is mocked with in-memory fixtures, so:
 
 ---
 
+## 7. Defined tool invocation — no agent loop required
+
+**Problem.** Even with skills-bound tool discovery, a workflow that needs a
+known sequence (do-not-send gate → research → draft) still runs as a
+model-driven chain of tool calls — and with dozens of tools the model must also
+pick “which tool next?”.
+
+**Innovation.** The agent stops being the orchestrator:
+
+- `gtm_agent/direct.py` exposes deterministic runners that invoke the mocked
+  tools directly in the defined order and enforce the same gates (do-not-send,
+  no-recent-touch, draft queueing for rep approval). The CLI exposes them as
+  `python main.py direct lead|intel|prep …`.
+- The deep agents also ship two further shapes: the **code interpreter**
+  (`CodeInterpreterMiddleware` + PTC allowlist, below) and the **LLM tool
+  selector** (`LLMToolSelectorMiddleware`, §9).
+
+**Evidence.** `tests/smoke_test_defined_invocation.py` (gates + intel + prep run
+with zero model turns) and the `defined invocation` scenario in
+`python main.py test` both pass offline.
+
+## 8. Code interpreter: programmatic tool calling (PTC)
+
+**Problem.** Serial model-mediated tool calls: every tool call costs a full model
+round trip (tokens, latency, retry).
+
+**Innovation.** deepagents' interpreter lets the model compose tool calls in
+code. `CodeInterpreterMiddleware(ptc=[...])` installs an `eval` tool; the model
+authors a JS program; the harness bridges the allowlisted tools into
+`globalThis.tools.<camelCase>` and executes the program, returning
+`<result>...</result>`.
+
+A whole GTM workflow then becomes one program. Offline, with the same scripted
+model, the outbound playbook's tool trace collapses from
+`read_file → check_contact_history → lookup_lead → web_search_company →
+draft_slack_followup` (4 tool-call turns) to a single `eval`:
+
+| Run | Model turns | Tool-call turns |
+|---|---|---|
+| loop, unpinned skill | 6 | 5 |
+| loop, pinned skill | 5 | 4 |
+| interpreter, pinned skill | 2 | 1 (`eval`) |
+
+The JS program gates on `checkContactHistory`, batches `lookupLead` +
+`webSearchCompany` + `getGongTranscripts` with `Promise.all`, drafts, and
+queues for approval. The queued draft is asserted **byte-identical** to the
+loop version's, so the cheaper execution path does not change the outcome
+(only the number of model round trips).
+
+**Evidence.** `tests/smoke_test_interpreter_ptc.py` (eval → PTC bridge → tool
+result) and the `interpreter PTC` scenario in `python main.py test` (one eval
+per workflow for outbound / intel / prep, blocked leads stay blocked,
+routing + interpreter compose).
+
+## 9. LLM tool selection before the loop
+
+**Problem.** Even inside the agent loop, a large toolset makes the next-tool
+decision harder and the prompt bigger.
+
+**Innovation.** `build_tool_selector_agent()` wires
+`langchain.agents.middleware.LLMToolSelectorMiddleware`: a (cheap) model call
+picks the relevant tool names from the catalog *before* the loop runs, and only
+those are bound for the agent model. `always_include` covers tools that must
+stay visible (e.g. `read_file` for skills).
+
+**Evidence.** Offline scenario `tool selector` in `python main.py test`: the
+selector sees the full catalog, selects one tool, and the agent loop then binds
+exactly that one tool (1 of 50) — asserted from the per-call bound-tool
+snapshot.
+
+The three invocation shapes are independent knobs and compose through
+`build_routed_agent(..., extra_middleware=[…])`. With `--route --interpreter
+--selector` the run is routed, one tool (`eval`) is bound, and the whole
+outbound playbook executes as one program — verified offline.
+
+---
+
 ## Honest-evidence note
 
 The routing *mechanism* is measured (§3), but the catalog **contents** are
@@ -131,4 +208,9 @@ provider pricing pages and a small eval set before production.
 | Routing middleware, telemetry, ledger | `gtm_agent/routing.py` |
 | Catalog overlay (data, not code) | `gtm_agent/catalog_overlay.json` |
 | Disclosure smoke test (offline) | `tests/smoke_test_skill_tools.py` |
+| Offline LLM simulator (scripted runs, GTM simulator) | `gtm_agent/simulator.py`, `main.py` |
+| Defined tool invocation workflows (no agent loop) | `gtm_agent/direct.py`, `main.py` (`python main.py direct …`) |
+| Interpreter / PTC agent builder | `gtm_agent/agent.py` (`build_interpreter_agent`) |
+| Tool-selector agent builder | `gtm_agent/agent.py` (`build_tool_selector_agent`) |
+| Interpreter / defined / selector scenarios | `main.py` (`GTMAgentTestRunner`) |
 | CLI: live/routed runs, `route` inspector | `main.py` |
