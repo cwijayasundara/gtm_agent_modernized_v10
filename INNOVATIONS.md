@@ -40,37 +40,45 @@ Consequences:
   every model call and asserts deferred schemas are disclosed only after the
   `SKILL.md` is read — no API key required.
 
-### 1.0 Intent is matched to a skill, not to a tool
+### 1.0 Intent is matched to a skill, then to tools
 
 The system prompt is not a 50-way dispatch table. `GTM_SYSTEM_PROMPT` is a
 **policy prompt**: workflow order, safety gates, approval semantics, and turn
-budget. Its only routing instruction is "Load the matching skill before
-acting" (`gtm_agent/agent.py:48-75`). The `build_*` functions are not separate
-per-intent agents; they configure the same graph with different middleware.
+budget. It does not enumerate tool routes.
 
-The intent → tool path is:
+There are three ways a request reaches a skill:
+
+1. **Explicit workflow** — `lead`, `briefing`, and `prep` pin the skill before
+   the graph starts. The user already chose the workflow via the CLI.
+2. **Intent router** — `auto` and `intent` call `IntentRouter` before the agent
+   is built. It asks OpenAI Decisions for a `choice` over the runnable
+   workflows plus a `needs_clarification` predicate. High confidence pins the
+   skill; low confidence asks for a target instead of guessing.
+3. **Model fallback** — when neither of the above applies, `SkillsMiddleware`
+   still injects each skill's description and the model matches the request
+   against it.
+
+The full path is:
 
 ```
-user intent
+user request
   │
-  ├─ 1. skill match ......... model compares the task with injected SKILL.md
-  │                            descriptions ("Trigger on: new lead, follow-up…")
-  ├─ 2. skill load .......... read_file / pinned_skills loads the playbook
-  ├─ 3. tool disclosure ..... metadata.include_tools undefer only that skill's
-  │                            tools (SkillsMiddleware)
-  ├─ 4. tool choice ......... model picks among the disclosed schemas
-  └─ 5. invocation .......... normal tool call, JS/PTC program, or direct call
+  ├─ explicit command ───────► pinned skill
+  ├─ IntentRouter ───────────► skill / clarify / general
+  └─ model fallback ─────────► match SKILL.md description
+                                 │
+                                 ▼
+  read or pin SKILL.md ──► metadata.include_tools undefer only that skill's
+                                 tools (SkillsMiddleware)
+                                 │
+                                 ▼
+  model picks among disclosed schemas ──► normal tool call / PTC / direct
 ```
 
-The intent signal is the skill **description**, not a branch in the prompt.
-`outbound-followup` triggers on "new lead, inbound lead, follow-up, outreach,
-email draft…" and owns 12 tools; `account-intelligence` triggers on "account
-review, expansion opportunity, deal risk, renewal…" and owns 15;
-`meeting-prep` triggers on "meeting prep, discovery call, QBR prep…" and owns
-8. `SkillsMiddleware` injects those descriptions and tells the model to match
-the task against them.
-`metadata.include_tools` then supplies the tool family. This is semantic
-routing done by the model, with a deterministic disclosure rule underneath.
+`outbound-followup` owns 12 tools, `account-intelligence` 15,
+`customer-health` 12, and `meeting-prep` 8; `competitor-analysis` is
+methodology-only. `metadata.include_tools` supplies the tool family once the
+skill is selected.
 
 What the system prompt *does* control is call shape: batch independent lookups,
 do not re-read a pinned skill, gate before drafting, keep the final summary
@@ -80,8 +88,8 @@ The five layers answer five different questions:
 
 | Layer | Question | Mechanism | Where |
 |---|---|---|---|
-| 1. Skill binding | Which workflow/tool family applies? | description match + `include_tools` + deferral | `skills/*/SKILL.md` |
-| 2. Intent router | Which workflow is this request? | OpenAI Decisions `Choice` + clarification predicate | `gtm_agent/intent.py` |
+| 1. Skill binding | How does the chosen workflow's tool family become visible? | `include_tools` + deferred schemas + `SkillsMiddleware` | `skills/*/SKILL.md` |
+| 2. Intent router | Which workflow is this request? | explicit pin or OpenAI Decisions `Choice` + clarification predicate | `main.py`, `gtm_agent/intent.py` |
 | 3. Tool selection | Which few tools are relevant *now*? | conversation transcript + OpenAI Decisions | `gtm_agent/selection.py` |
 | 4. Interpreter/PTC | How can many read-only calls be composed? | one JS program calling allowlisted `tools.*` | `gtm_agent/ptc.py` |
 | 5. Defined workflow | Can the model be removed entirely? | authored tool order | `gtm_agent/direct.py` |
@@ -349,15 +357,18 @@ is layered on the skills-bound agent as a **model-selection middleware**:
 custom `CallTelemetryMiddleware` (outermost, so retry/escalation time is
 included) times every model call and captures token details **including
 prompt-cache read and cache-creation counts** — the number that actually
-validates the sticky-model choice. A `RoutingTelemetry` collector joins:
+validates the sticky-model choice. `RoutingTelemetry` covers routing and cost:
 
 - routing decisions (model, tier, reason, stickiness, classifier used,
   classification latency, escalation events)
 - per-call latency, input/output tokens, cache hits
 - **dollar cost** per call and per run
 
-…into a printed summary plus an exported JSON ledger (`out/usage/ledger-*.json`),
-turning model-selection claims into inspectable evidence.
+…into a printed summary plus an exported JSON ledger (`out/usage/ledger-*.json`).
+The runner footer adds the selection-stack evidence that is not a model call:
+intent (intent, skill, action, confidence, classifier, latency), tool selection
+(selected tools, probabilities, events), the PTC allowlist names, and HITL
+approve/reject decisions.
 
 ## 4. Turn-budget discipline as prompt architecture
 
@@ -374,7 +385,8 @@ system prompt and skills encode an explicit **turn economy**:
 This treats prompt engineering as **latency engineering**, with the
 telemetry ledger (§3) available to verify the budget is actually met. It is
 call-shape policy, not intent routing: by the time these rules apply, layer 1
-(skill disclosure) or layer 2 (selector) has already narrowed the tool surface.
+(skill binding) and layer 3 (tool selection) have already narrowed the tool
+surface.
 
 ## 5. Guardrails by workflow design (human-in-the-loop)
 
@@ -388,15 +400,20 @@ and never sends anything autonomously:
 - drafts are queued to Slack with rationale **and sources** attached, for
   explicit rep approval
 - every draft is explainable by construction (rationale for the chosen angle)
+- action tools are outside the PTC bridge; `--approve` pauses them through
+  `HumanInTheLoopMiddleware`, and the runner records the approve/reject
+  decision in the footer
+- PTC itself is read-only, so a model-authored program cannot bypass the action
+  boundary
 
 ## 6. Offline-first, evidence-first engineering
 
 **Innovation.** Every system of record (Salesforce, Gong, LinkedIn, Exa,
 BigQuery, Zendesk, Slack) is mocked with in-memory fixtures, so:
 
-- the full demo, including routing and the disclosure smoke test, runs with
-  **zero credentials** (fake chat model for tests, heuristic classifier for
-  routing)
+- the full demo, including routing, intent classification, tool selection, and
+  the disclosure smoke test, runs with **zero credentials** (fake chat model
+  for tests; deterministic fallbacks for routing, intent, and tool selection)
 - the same code path is exercised live when keys are present — mock/live is
   a runner flag, not a fork
 
@@ -552,12 +569,14 @@ baseline.
 | 50-tool mock stack, `DEFERRED` marker | `gtm_agent/tools.py` |
 | Per-skill tool bindings (§1) | `skills/*/SKILL.md` (`metadata.include_tools`) |
 | Disclosure mechanism (§1.2–1.4) | `deepagents/middleware/skills.py`, `middleware/_skill_tools.py` (installed, 0.7.23) |
+| Decision backend + selector factory | `gtm_agent/decisions.py` |
+| Skill frontmatter parser | `gtm_agent/skills.py` |
 | Routing middleware, telemetry, ledger | `gtm_agent/routing.py` |
 | Catalog overlay (data, not code) | `gtm_agent/catalog_overlay.json` |
 | Disclosure smoke test (offline) | `tests/smoke_test_skill_tools.py` |
 | Offline LLM simulator (scripted runs, GTM simulator) | `gtm_agent/simulator.py`, `main.py` |
 | Defined tool invocation workflows (no agent loop) | `gtm_agent/direct.py`, `main.py` (`python main.py direct …`) |
 | Interpreter / PTC agent builder | `gtm_agent/agent.py` (`build_interpreter_agent`) |
-| Tool-selector agent builder | `gtm_agent/agent.py` (`build_tool_selector_agent`) |
-| Interpreter / defined / selector scenarios | `main.py` (`GTMAgentTestRunner`) |
-| CLI: live/routed runs, `route` inspector | `main.py` |
+| Legacy LLM tool-selector builder (not on the CLI path) | `gtm_agent/agent.py` (`build_tool_selector_agent`) |
+| Interpreter / defined / selector / intent / HITL scenarios | `main.py` (`GTMAgentTestRunner`), `tests/test_*.py` |
+| CLI: live/routed runs, `intent`, `auto`, `--approve` | `main.py` |

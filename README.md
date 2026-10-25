@@ -158,7 +158,7 @@ same `pending_approval` draft list the agent uses.
 |---|---|---|
 | Agent loop, skill not pinned | 6 | 5 (incl. `read_file`) |
 | Agent loop, skill pinned | 5 | 4 |
-| Interpreter (PTC), skill pinned | 2 | 5, all inside **1** `eval` |
+| Interpreter (PTC), skill pinned | 3 | 2 visible (`eval` + `draft_slack_followup`); 5 tool calls total |
 | Defined workflow (`direct`) | **0** | 5 |
 
 The interpreter run's queued draft is asserted **byte-identical** to the loop version's, so
@@ -233,42 +233,50 @@ python main.py direct …    ← bypasses the whole graph: gtm_agent/direct.py c
 
 ## Run it
 
-### Quick start — no API key needed
+### 1. Install
 
-Requires Python ≥ 3.10 (this repo is developed/tested on 3.13).
+Requires Python ≥ 3.10 (developed/tested on 3.13). The repo uses `uv`:
 
 ```bash
 uv venv .venv
-uv pip install -e .                 # deepagents, langchain-anthropic, python-dotenv
-.venv/bin/python main.py test       # 8/8 offline scenarios
-.venv/bin/python main.py            # a full simulated GTM day (3 leads + briefing + prep + inbox)
+uv pip install -e ".[dev,interpreter]"
+```
+
+- `dev` adds `pytest` for the unit suite.
+- `interpreter` adds the optional QuickJS runtime for `--interpreter`.
+- If you only want the basic agent loop, `uv pip install -e .` is enough;
+  `--interpreter` will then print an install hint.
+
+Optional: copy the environment template and fill in keys later.
+
+```bash
+cp .env.example .env
+```
+
+### 2. Quick start — no API key needed
+
+```bash
+.venv/bin/python main.py test       # 8 rule-based scenarios
+.venv/bin/python main.py            # a full simulated GTM day
 ```
 
 The offline runs use a scripted fake chat model (`gtm_agent/simulator.py`) but the **real**
 deepagents graph: real tool-calling loop, real skills middleware, real filesystem backend.
 Only the LLM is simulated.
 
-### Optional: enable the code interpreter (layer 3)
+Run one workflow at a time:
 
 ```bash
-uv pip install -e ".[interpreter]"  # adds deepagents[quickjs] → langchain-quickjs
-```
-
-Without this extra the rest of the app works; `--interpreter` raises a clear install hint.
-
-### The workflows
-
-```bash
-.venv/bin/python main.py                          # full simulated day
 .venv/bin/python main.py lead lead-1042           # inbound lead follow-up
 .venv/bin/python main.py briefing "Helix Health"  # account-intelligence briefing
 .venv/bin/python main.py prep "Priya Sharma"      # meeting-prep brief
 .venv/bin/python main.py inbox                    # drafts pending rep approval
 ```
 
-Artifacts land in `out/drafts/`, `out/briefings/`, `out/meeting-preps/`; nothing is sent.
+Artifacts land in `out/drafts/`, `out/briefings/`, and `out/meeting-preps/`.
+Nothing is sent: drafts are queued with `status: pending_approval`.
 
-### Execution modes
+### 3. Try the selection layers
 
 ```bash
 # Layer 1 — skills-scoped agent loop (default)
@@ -277,9 +285,10 @@ Artifacts land in `out/drafts/`, `out/briefings/`, `out/meeting-preps/`; nothing
 # Layer 2 — classify a natural-language request
 .venv/bin/python main.py intent "Prep me for my meeting with Priya Sharma"
 .venv/bin/python main.py auto "Follow up with lead-1042"
-.venv/bin/python main.py --decision-backend offline auto "Prep me for Priya Sharma"
+.venv/bin/python main.py auto "Give me an account intelligence briefing for Helix Health"
+.venv/bin/python main.py auto "Show me the approval inbox"
 
-# Layer 3 — conversation-aware Decisions tool selection
+# Layer 3 — conversation-aware tool selection
 .venv/bin/python main.py --selector lead lead-1042
 
 # Layer 4 — read-only code interpreter / programmatic tool calling
@@ -292,42 +301,100 @@ Artifacts land in `out/drafts/`, `out/briefings/`, `out/meeting-preps/`; nothing
 .venv/bin/python main.py direct intel "Helix Health"
 .venv/bin/python main.py direct prep "Priya Sharma"
 
-# Approval boundary for action tools
-.venv/bin/python main.py --approve lead lead-1042       # interactive
-.venv/bin/python main.py --approve --yes lead lead-1042 # demo auto-approve
-
-# Layers compose: routed + interpreter + selector
+# Compose layers
 .venv/bin/python main.py --route --interpreter --selector lead lead-1042
-# tool trace: eval → draft_slack_followup | routing: gpt-6-luna (sticky)
 ```
 
-`--interpreter` prints its actual skill-derived PTC footprint in the run footer:
+`intent` only classifies; `auto` classifies and dispatches. `auto` resolves targets from the
+demo fixtures (`lead-1042`, `Helix Health`, `Priya Sharma`) and asks for a target when it cannot
+find one.
 
-```
-  tool trace:  eval → draft_slack_followup
-  invocation:  code interpreter — 1 eval program(s), 10 tools on the PTC allowlist
-```
+`--selector` sends the recent conversation to OpenAI Decisions and binds only the selected
+tools. Without an OpenAI key it falls back to keeping all tools. `--interpreter` derives a
+read-only PTC allowlist from the selected skill; the draft is then queued through the normal
+tool path.
 
-### Live mode (Claude Haiku 5.5)
+### 4. Approval boundary for action tools
 
 ```bash
-cp .env.example .env               # then set ANTHROPIC_API_KEY
+# Interactive: prints each action and asks approve/reject
+.venv/bin/python main.py --approve lead lead-1042
+
+# Non-interactive demo: auto-approve every requested action
+.venv/bin/python main.py --approve --yes lead lead-1042
+
+# Approval + interpreter + routing
+.venv/bin/python main.py --approve --yes --route --interpreter lead lead-1042
+```
+
+`draft_slack_followup` and `queue_followup_sequence` are never bridged into PTC. They run as
+normal tools behind `HumanInTheLoopMiddleware`. Rejecting leaves the draft queue empty.
+
+### 5. Optional: live OpenAI Decisions
+
+Intent routing, conversation-aware tool selection, and `--route` use the OpenAI Decisions API
+when a key is available. Without a key they use deterministic offline fallbacks.
+
+```bash
+# Put a key in .env, or export it.
+export OPENAI_API_KEY=sk-...
+# DECISIONS_API_KEY is also accepted.
+
+# Use Decisions for auto-intent and tool selection
+.venv/bin/python main.py --decision-backend openai auto "Follow up with lead-1042"
+.venv/bin/python main.py --decision-backend openai --selector lead lead-1042
+
+# --decisions is a shortcut for --decision-backend openai
+.venv/bin/python main.py --decisions intent "Prep me for Priya Sharma"
+
+# Force offline behavior
+.venv/bin/python main.py --decision-backend offline auto "Prep me for Priya Sharma"
+```
+
+`--route` remains independent: it uses `decision_harness` to choose the chat model
+(`--decision-backend` controls intent/tool decisions).
+
+### 6. Optional: live Claude model
+
+```bash
+cp .env.example .env               # set ANTHROPIC_API_KEY
 .venv/bin/python main.py --live lead lead-1042
 .venv/bin/python main.py --live briefing "Helix Health"
 .venv/bin/python main.py --live prep "Priya Sharma"
+
+# Live model + Decisions + approval
 .venv/bin/python main.py --live --decision-backend openai --approve lead lead-1042
 ```
 
-Example live prompts (the model drives the loop itself):
+Example live prompts:
 
 - `"New inbound lead: lead-1043 (Acme Robotics). Run the standard follow-up."`
 - `"Give me an account intelligence briefing for Helix Health."`
 - `"Position us against Pinecone and Weaviate."` (methodology-only skill)
 
-### Tests and proofs
+### 7. Configuration
+
+| Variable | Default | Used by |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | — | `--live` Claude calls |
+| `OPENAI_API_KEY` / `DECISIONS_API_KEY` | — | intent, tool selection, model routing |
+| `GTM_DECISION_BACKEND` | `auto` | `auto`, `openai`, or `offline` |
+| `GTM_DECISION_MODEL` | `gpt-6-luna` | OpenAI Decisions model |
+| `GTM_INTENT_CONFIDENCE_FLOOR` | `0.65` | intent route vs clarify |
+| `GTM_TOOL_SELECTION_MAX_TOOLS` | `6` | live tool-selection cap |
+| `GTM_TOOL_SELECTION_THRESHOLD` | `0.5` | live tool-selection probability floor |
+| `GTM_MODEL_ID` | `claude-haiku-5-5` | default chat model |
+| `FIREWORKS_API_KEY` | — | fast tiers for `--route` |
+| `LANGSMITH_*` | — | optional tracing |
+
+`auto` selects OpenAI Decisions when a key is present, otherwise offline. Explicit
+`--decision-backend openai` fails fast if no key is configured.
+
+### 8. Tests and proofs
 
 ```bash
-.venv/bin/python main.py test -v                 # 8 scenarios, per-model-call disclosure snapshots
+.venv/bin/python -m pytest -q                    # 33 unit tests
+.venv/bin/python main.py test -v                 # 8 offline scenarios, disclosure snapshots
 
 .venv/bin/python tests/smoke_test_skill_tools.py        # deferred tools disclosed only after SKILL.md read
 .venv/bin/python tests/smoke_test_defined_invocation.py # gates + intel + prep with zero model turns
