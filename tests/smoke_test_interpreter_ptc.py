@@ -6,8 +6,8 @@ agent is given a programmatic tool calling surface:
     build_interpreter_agent() -> create_deep_agent(..., middleware=[CodeInterpreterMiddleware(ptc=[...])])
 
 The model writes a small JS program via the interpreter's `eval` tool; the
-harness bridges the allowlisted tools into the `tools` namespace and executes
-the program.
+harness bridges the allowlisted read-only tools into the `tools` namespace and
+executes the program. Action tools stay on the normal HITL-gated path.
 
 Run:  .venv/bin/python tests/smoke_test_interpreter_ptc.py
 """
