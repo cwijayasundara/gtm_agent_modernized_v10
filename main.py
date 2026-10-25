@@ -33,7 +33,8 @@ from langgraph.checkpoint.memory import InMemorySaver
 from gtm_agent import direct, tools
 from gtm_agent.agent import build_agent
 from gtm_agent.decisions import decision_env, make_tool_selector, resolve_backend
-from gtm_agent.hitl import CliApprover, interrupt_config, run_with_hitl
+from gtm_agent.hitl import AutoApprover, CliApprover, interrupt_config, run_with_hitl
+from gtm_agent.intent import IntentRouter, resolve_target
 from gtm_agent.ptc import ptc_allowlist
 from gtm_agent.routing import RoutingTelemetry
 from gtm_agent.selection import (
@@ -665,12 +666,22 @@ def main() -> int:
     parser.add_argument("--live", action="store_true", help="run on real models (keys from .env)")
     parser.add_argument("--route", action="store_true", help="route each run to the best model (glm-5.3-flash / deepseek-4-flash / gpt-6-luna / claude-haiku-5-5) via decision_harness; logs tokens, $ and latency")
     parser.add_argument("--interpreter", action="store_true", help="run the agent via the code interpreter (programmatic tool calling / PTC allowlist)")
-    parser.add_argument("--selector", action="store_true", help="run the agent with the LLM tool selector middleware")
+    parser.add_argument("--selector", action="store_true", help="run the agent with the conversation-aware Decisions tool selector")
+    parser.add_argument("--decision-backend", choices=["auto", "openai", "offline"], default="auto", help="backend for intent/tool decisions (default: auto)")
+    parser.add_argument("--decisions", action="store_true", help="shortcut for --decision-backend openai")
+    parser.add_argument("--approve", action="store_true", help="require HITL approval before action tools run")
+    parser.add_argument("--yes", action="store_true", help="auto-approve HITL actions (for demos/tests)")
     sub = parser.add_subparsers(dest="cmd")
 
     route_p = sub.add_parser("route", help="show which model a query routes to (works offline via heuristic; add --decisions to use the Decisions API)")
     route_p.add_argument("query", nargs="+")
     route_p.add_argument("--decisions", action="store_true", help="force the Decisions API classifier (needs DECISIONS_API_KEY/OPENAI_API_KEY)")
+
+    intent_p = sub.add_parser("intent", help="classify a natural-language request without running a workflow")
+    intent_p.add_argument("prompt", nargs="+")
+
+    auto_p = sub.add_parser("auto", help="classify a request and dispatch to the matching demo workflow")
+    auto_p.add_argument("prompt", nargs="+")
 
     lead_p = sub.add_parser("lead", help="process one inbound lead (e.g. lead-1042)")
     lead_p.add_argument("lead_id")
@@ -695,6 +706,17 @@ def main() -> int:
     dp.add_argument("contact")
 
     args = parser.parse_args()
+    decision_backend = (
+        "openai"
+        if args.decisions and args.cmd != "route"
+        else args.decision_backend
+    )
+
+    if args.cmd == "intent":
+        query = " ".join(args.prompt)
+        decision = IntentRouter(backend=decision_backend).classify(query)
+        _print_intent(decision)
+        return 0
 
     if args.cmd == "route":
         from gtm_agent.routing import classify_query, friendly
@@ -710,7 +732,44 @@ def main() -> int:
             print(f"  event: {e}")
         return 0
 
-    runner = GTMAgentRunner(live=args.live, routed=args.route, interpreter=args.interpreter, selector=args.selector)
+    reviewer = AutoApprover(True) if args.yes else CliApprover()
+    runner = GTMAgentRunner(
+        live=args.live,
+        routed=args.route,
+        interpreter=args.interpreter,
+        selector=args.selector,
+        decision_backend=decision_backend,
+        approve=args.approve,
+        reviewer=reviewer if args.approve else None,
+    )
+
+    if args.cmd == "auto":
+        query = " ".join(args.prompt)
+        decision = IntentRouter(backend=decision_backend).classify(query)
+        _print_intent(decision)
+        runner.last_intent = decision
+        if decision.action != "route":
+            print("Clarification needed. Try: lead-1042, Helix Health, or Priya Sharma.")
+            return 0
+
+        target = resolve_target(decision.intent, query)
+        if decision.intent in {"outbound_followup", "account_intelligence", "meeting_prep"} and target is None:
+            print("Could not resolve a demo target. Try: lead-1042, Helix Health, or Priya Sharma.")
+            return 0
+
+        if decision.intent == "outbound_followup":
+            runner.process_lead(target or "")
+        elif decision.intent == "account_intelligence":
+            runner.briefing(target or "")
+        elif decision.intent == "meeting_prep":
+            runner.prep(target or "")
+        elif decision.intent == "inbox_review":
+            runner.inbox()
+        else:
+            print("No workflow matched; staying in general mode.")
+            return 0
+        runner.telemetry.print_report()
+        return 0
 
     if args.cmd == "lead":
         runner.process_lead(args.lead_id)
@@ -738,6 +797,18 @@ def main() -> int:
 
     runner.run_day()
     return 0
+
+
+def _print_intent(decision: Any) -> None:
+    print(f"\nintent:     {decision.intent}")
+    print(f"skill:      {decision.skill or '(none)'}")
+    print(f"action:     {decision.action}")
+    print(f"confidence: {decision.confidence:.2f}")
+    print(f"classifier: {decision.classifier} in {decision.latency_ms}ms")
+    if decision.clarify_probability:
+        print(f"clarify:    {decision.clarify_probability:.2f}")
+    for event in decision.events:
+        print(f"  event: {event}")
 
 
 if __name__ == "__main__":
