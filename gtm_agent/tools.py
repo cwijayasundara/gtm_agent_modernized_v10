@@ -161,6 +161,20 @@ _LAST_INTERACTIONS: dict[str, dict[str, str]] = {
     },
 }
 
+# Public demo-fixture names used by the auto target resolver.
+KNOWN_LEADS = tuple(_LEADS)
+KNOWN_ACCOUNTS = tuple(dict.fromkeys([
+    *_USAGE_SIGNALS,
+    *_HIRING,
+    *_FUNDING,
+    *(lead["company"] for lead in _LEADS.values()),
+]))
+KNOWN_CONTACTS = tuple(dict.fromkeys([
+    *_DOSSIERS,
+    *_LAST_INTERACTIONS,
+    *(lead["contact"] for lead in _LEADS.values()),
+]))
+
 
 # ---------------------------------------------------------------------------
 # Bespoke deferred, skill-bound tools (used by the offline test scenarios)
