@@ -299,6 +299,8 @@ def build_routed_agent(
     models_override: dict[str, Any] | None = None,
     extra_middleware: list[Any] | None = None,
     system_prompt: str | None = None,
+    interrupt_on: dict[str, Any] | None = None,
+    checkpointer: Any | None = None,
 ):
     """GTM deep agent whose model is chosen per query (sticky per thread).
 
@@ -342,6 +344,8 @@ def build_routed_agent(
         backend=FilesystemBackend(root_dir=PROJECT_ROOT),
         # Telemetry outermost: measures the full per-call time incl. retries.
         middleware=[telemetry.calls_middleware, middleware, *(extra_middleware or [])],
+        interrupt_on=interrupt_on,
+        checkpointer=checkpointer,
     )
     return agent
 

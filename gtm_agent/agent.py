@@ -38,6 +38,7 @@ from deepagents.backends import FilesystemBackend
 from langchain.agents.middleware import LLMToolSelectorMiddleware
 
 from . import tools
+from .ptc import ptc_allowlist
 
 # Load API keys / settings from a `.env` file at the project root (if present).
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -79,24 +80,30 @@ Speed rules (these matter — every model round trip costs seconds):
 # *how to structure a GTM workflow* as one program.
 GTM_INTERPRETER_SYSTEM_PROMPT = GTM_SYSTEM_PROMPT + """
 Interpreter rules (overriding the turn-budget rules above):
-- Do the workflow in code. Write ONE `eval` program that gates, batches,
-  composes, and queues — not a sequence of tool-call turns.
+- Do the workflow in code. Write ONE `eval` program that gates, batches, and
+  composes — not a sequence of tool-call turns.
+- The `eval` bridge is READ-ONLY. Never call `draftSlackFollowup` or
+  `queueFollowupSequence` inside the program; those actions stay on the normal
+  tool path so a rep can approve them.
 - Gate first. `checkContactHistory` runs before any drafting; if it reports a
   do-not-send signal or a teammate touch within 3 days, return a `blocked`
   result and stop — do not draft.
 - Batch independent lookups with `Promise.all` inside the same program.
 - Chain dependent calls in the same program (use the CRM record's company name
   as the research input) instead of returning intermediate values.
-- Only `draftSlackFollowup` after the gates pass; the draft is queued for rep
-  approval and must never be sent.
 - Return a small object from the program (`{ outcome, draft, rationale, ... }`)
   and keep the final prose summary under 120 words.
+- After the program returns a draft, call `draft_slack_followup` as a normal
+  tool to queue it for rep approval. Never send anything directly.
 """
 
 # Tools the interpreter is allowed to bridge into JavaScript
 # (`globalThis.tools[<camelCase>] = ...; tools.<camelCase>(...)`).
 # Mirrors the full GTM tool surface used by the defined workflows in
 # ``gtm_agent.direct``.
+# Legacy fallback for callers that do not pass a skill. The skill-derived
+# path is read-only; this temporary list keeps the pre-update simulator green
+# until Task 9 moves the draft side effect out of eval.
 DEFAULT_INTERPRETER_PTC: list[str] = [
     "lookup_lead",
     "check_contact_history",
@@ -136,7 +143,13 @@ def interpreter_middleware(ptc: list[str] | None = None) -> Any:
     )
 
 
-def build_agent(model: BaseChatModel | None = None):
+def build_agent(
+    model: BaseChatModel | None = None,
+    *,
+    extra_middleware: list[Any] | None = None,
+    interrupt_on: dict[str, Any] | None = None,
+    checkpointer: Any | None = None,
+):
     """Build the GTM deep agent with skills-backed tool binding."""
     return create_deep_agent(
         model=_make_model(model),
@@ -144,16 +157,23 @@ def build_agent(model: BaseChatModel | None = None):
         system_prompt=GTM_SYSTEM_PROMPT,
         skills=["/skills/"],
         backend=FilesystemBackend(root_dir=PROJECT_ROOT),
+        middleware=[*(extra_middleware or [])],
+        interrupt_on=interrupt_on,
+        checkpointer=checkpointer,
     )
 
 
 def build_interpreter_agent(
     model: BaseChatModel | None = None,
     *,
+    skill: str | None = None,
     ptc: list[str] | None = None,
     system_prompt: str | None = None,
     skills: list[str] | None = None,
     backend: Any | None = None,
+    extra_middleware: list[Any] | None = None,
+    interrupt_on: dict[str, Any] | None = None,
+    checkpointer: Any | None = None,
 ) -> Any:
     """Build the GTM deep agent that invokes tools through a code interpreter.
 
@@ -169,19 +189,28 @@ def build_interpreter_agent(
 
     Args:
         model: Chat model override (defaults to ``GTM_MODEL_ID``).
-        ptc: Allowlisted tool names the interpreter may bridge. ``None`` uses
-            :data:`DEFAULT_INTERPRETER_PTC`.
+        skill: Selected skill. When ``ptc`` is omitted, the allowlist is derived
+            from this skill's ``include_tools``.
+        ptc: Allowlisted tool names the interpreter may bridge. ``None`` uses the
+            skill-derived list, falling back to :data:`DEFAULT_INTERPRETER_PTC`.
         system_prompt: Override the GTM system prompt (optional).
         skills: Skill globs for ``create_deep_agent`` (optional).
         backend: Filesystem backend override (optional).
+        extra_middleware: Additional middleware placed after the interpreter.
+        interrupt_on: HITL configuration for action tools.
+        checkpointer: LangGraph checkpointer required for HITL resume.
     """
+    if ptc is None:
+        ptc = ptc_allowlist(skill) if skill is not None else DEFAULT_INTERPRETER_PTC
     return create_deep_agent(
         model=_make_model(model),
         tools=tools.ALL_TOOLS,
         system_prompt=system_prompt or GTM_INTERPRETER_SYSTEM_PROMPT,
         skills=skills or ["/skills/"],
         backend=backend or FilesystemBackend(root_dir=PROJECT_ROOT),
-        middleware=[interpreter_middleware(ptc)],
+        middleware=[interpreter_middleware(ptc), *(extra_middleware or [])],
+        interrupt_on=interrupt_on,
+        checkpointer=checkpointer,
     )
 
 
@@ -193,6 +222,9 @@ def build_tool_selector_agent(
     system_prompt: str | None = None,
     skills: list[str] | None = None,
     backend: Any | None = None,
+    extra_middleware: list[Any] | None = None,
+    interrupt_on: dict[str, Any] | None = None,
+    checkpointer: Any | None = None,
 ) -> Any:
     """Build the GTM deep agent whose tool set is narrowed by an LLM selector.
 
@@ -212,6 +244,9 @@ def build_tool_selector_agent(
                 model=_make_model(model),
                 max_tools=max_tools,
                 always_include=always_include or [],
-            )
+            ),
+            *(extra_middleware or []),
         ],
+        interrupt_on=interrupt_on,
+        checkpointer=checkpointer,
     )
