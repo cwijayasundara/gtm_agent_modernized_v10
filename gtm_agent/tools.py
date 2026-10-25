@@ -191,7 +191,7 @@ def web_search_company(company: str) -> str:
     return _WEB_RESEARCH.get(company, f"No recent public AI activity found for {company}.")
 
 
-@tool(extras=DEFERRED)
+@tool(extras={**DEFERRED, "side_effect": True})
 def draft_slack_followup(lead_id: str, draft: str, rationale: str) -> str:
     """Queue a personalized outreach draft as a Slack DM for rep approval. NEVER sends directly; requires explicit rep approval. Include the draft body and the reasoning behind the chosen angle."""
     _SLACK_DRAFTS.append({"lead_id": lead_id, "draft": draft, "rationale": rationale, "status": "pending_approval"})
@@ -221,7 +221,13 @@ def get_funding_news(company: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _make_tool(name: str, description: str, fixture_fn: Callable[[str], Any] | None = None) -> BaseTool:
+def _make_tool(
+    name: str,
+    description: str,
+    fixture_fn: Callable[[str], Any] | None = None,
+    *,
+    side_effect: bool = False,
+) -> BaseTool:
     """Create a deferred mock tool with a generic `query` parameter."""
 
     def _impl(query: str = "") -> str:
@@ -233,7 +239,8 @@ def _make_tool(name: str, description: str, fixture_fn: Callable[[str], Any] | N
             "result": f"[simulated] No notable findings for {query!r} — mock data source.",
         })
 
-    return tool(name, description=description, extras=DEFERRED)(_impl)
+    extras = {**DEFERRED, **({"side_effect": True} if side_effect else {})}
+    return tool(name, description=description, extras=extras)(_impl)
 
 
 # --- outbound-followup (7) ---
@@ -252,6 +259,7 @@ get_marketing_touches = _make_tool(
 queue_followup_sequence = _make_tool(
     "queue_followup_sequence",
     "Optionally enroll an approved contact into a follow-up email sequence.",
+    side_effect=True,
 )
 get_contacts_at_account = _make_tool(
     "get_contacts_at_account",
