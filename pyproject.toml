@@ -9,6 +9,7 @@ dependencies = [
     "langchain-anthropic>=1.7.5",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
+    "decision-harness @ git+https://github.com/cwijayasundara/deep_agents_utils_v1.0.git@77da87e2c2421c8b819532c77caf07c51c190baf",
 ]
 
 [project.optional-dependencies]
