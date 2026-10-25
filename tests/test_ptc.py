@@ -1,5 +1,5 @@
 from gtm_agent import tools
-from gtm_agent.ptc import ptc_allowlist
+from gtm_agent.ptc import ptc_allowlist, read_only_names
 
 
 def test_outbound_allowlist_is_read_only():
@@ -24,3 +24,7 @@ def test_every_allowlisted_name_is_a_real_tool():
     names = {tool.name for tool in tools.ALL_TOOLS}
     for skill in ("outbound-followup", "account-intelligence", "meeting-prep"):
         assert set(ptc_allowlist(skill)) <= names
+
+
+def test_read_only_names_filters_explicit_side_effect_tools():
+    assert read_only_names(["draft_slack_followup", "lookup_lead"]) == ["lookup_lead"]

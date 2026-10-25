@@ -26,3 +26,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["gtm_agent"]
+
+[tool.hatch.metadata]
+allow-direct-references = true

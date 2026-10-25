@@ -11,7 +11,7 @@ and the deepagents `SkillsMiddleware` discloses a tool's schema to the model
 only once the skill that lists it has been read. That is the "binding tools
 to skills" feature this sample demonstrates — at 50 tools, the context
 savings and capability gating become very visible: a lead follow-up run
-never sees the 38 tools owned by other skills.
+never sees the 35 tools owned by other skills.
 
 Tool inventory (50):
 -  3 always available  : list_pending_drafts, get_current_date, search_internal_wiki

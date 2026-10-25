@@ -38,7 +38,7 @@ from deepagents.backends import FilesystemBackend
 from langchain.agents.middleware import LLMToolSelectorMiddleware
 
 from . import tools
-from .ptc import ptc_allowlist
+from .ptc import ptc_allowlist, read_only_names
 
 # Load API keys / settings from a `.env` file at the project root (if present).
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -200,6 +200,7 @@ def build_interpreter_agent(
     """
     if ptc is None:
         ptc = ptc_allowlist(skill) if skill is not None else DEFAULT_INTERPRETER_PTC
+    ptc = read_only_names(ptc)
     return create_deep_agent(
         model=_make_model(model),
         tools=tools.ALL_TOOLS,

@@ -78,8 +78,9 @@ class GTMAgentRunner:
     With interpreter=True the run uses the deep agent that invokes tools via
     the code interpreter (programmatic tool calling / PTC):
     `build_interpreter_agent` + `CodeInterpreterMiddleware(ptc=...)`.
-    With selector=True it uses the deep agent whose tool universe is narrowed
-    by `LLMToolSelectorMiddleware` via `build_tool_selector_agent`.
+    With selector=True it uses the conversation-aware Decisions tool selector
+    (`ConversationToolSelectionMiddleware`). With approve=True, action tools are
+    gated by `HumanInTheLoopMiddleware`.
     """
 
     def __init__(
@@ -675,7 +676,7 @@ def main() -> int:
 
     route_p = sub.add_parser("route", help="show which model a query routes to (works offline via heuristic; add --decisions to use the Decisions API)")
     route_p.add_argument("query", nargs="+")
-    route_p.add_argument("--decisions", action="store_true", help="force the Decisions API classifier (needs DECISIONS_API_KEY/OPENAI_API_KEY)")
+    route_p.add_argument("--decisions", dest="route_decisions", action="store_true", help="force the Decisions API classifier (needs DECISIONS_API_KEY/OPENAI_API_KEY)")
 
     intent_p = sub.add_parser("intent", help="classify a natural-language request without running a workflow")
     intent_p.add_argument("prompt", nargs="+")
@@ -722,7 +723,7 @@ def main() -> int:
         from gtm_agent.routing import classify_query, friendly
 
         query = " ".join(args.query)
-        d = classify_query(query, use_decisions=True if args.decisions else None)
+        d = classify_query(query, use_decisions=True if (args.route_decisions or args.decisions) else None)
         c = d["tier_confidence"]
         print(f"\nquery:      {query}")
         print(f"routed to:  {friendly(d['chosen_model'])}  (tier={d['tier']}, reason={d['reason']})")

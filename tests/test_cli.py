@@ -38,3 +38,28 @@ def test_auto_command_dispatches_offline(capsys, monkeypatch, tmp_path):
     out = capsys.readouterr().out
     assert "outbound-followup" in out
     assert "lead-1042" in out
+
+
+def test_route_decisions_flag_is_not_shadowed_by_subparser(monkeypatch, capsys):
+    import gtm_agent.routing as routing
+
+    seen = {}
+
+    def fake_classify(query, *, use_decisions=None):
+        seen["use_decisions"] = use_decisions
+        return {
+            "chosen_model": "openai/gpt-6-luna",
+            "tier": "balanced",
+            "reason": "classified",
+            "tier_confidence": 0.9,
+            "complexity": 1.0,
+            "needs_planning": 0.0,
+            "classifier": "fake",
+            "classification_latency_ms": 1,
+            "events": [],
+        }
+
+    monkeypatch.setattr(routing, "classify_query", fake_classify)
+    monkeypatch.setattr(sys, "argv", ["main.py", "--decisions", "route", "hello"])
+    assert main.main() == 0
+    assert seen["use_decisions"] is True

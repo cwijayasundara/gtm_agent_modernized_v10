@@ -305,7 +305,7 @@ Artifacts land in `out/drafts/`, `out/briefings/`, `out/meeting-preps/`; nothing
 
 ```
   tool trace:  eval → draft_slack_followup
-  invocation:  code interpreter — 1 eval program(s), 11 tools on the PTC allowlist
+  invocation:  code interpreter — 1 eval program(s), 10 tools on the PTC allowlist
 ```
 
 ### Live mode (Claude Haiku 5.5)
