@@ -108,6 +108,7 @@ class GTMAgentRunner:
         self.last_tool_selection: Any | None = None
         self.last_ptc_allowlist: list[str] = []
         self.last_intent: Any | None = None
+        self.last_hitl_decisions: list[dict[str, Any]] = []
         self._resolved_backend = resolve_backend(decision_backend) if selector else None
         self._tool_selector = tool_selector
         if self.selector and self._tool_selector is None:
@@ -118,6 +119,7 @@ class GTMAgentRunner:
     def _invoke(self, model: Any, prompt: str, pinned_skill: str | None = None) -> dict[str, Any]:
         _BOUND.clear()
         tools.reset_fixtures()
+        self.last_hitl_decisions = []
         self._thread_n += 1
         thread_id = f"gtm-{self._thread_n}-{prompt.split(':')[0][:20].replace(' ', '-')[:20]}"
         # Pinning a skill injects its SKILL.md before the first model call and
@@ -194,7 +196,13 @@ class GTMAgentRunner:
             config = {"recursion_limit": 40, "configurable": {"thread_id": thread_id}}
 
         result = (
-            run_with_hitl(agent, payload, config, self.reviewer)
+            run_with_hitl(
+                agent,
+                payload,
+                config,
+                self.reviewer,
+                records=self.last_hitl_decisions,
+            )
             if self.approve
             else agent.invoke(payload, config=config)
         )
@@ -244,16 +252,32 @@ class GTMAgentRunner:
         if self.last_intent is not None:
             print(
                 f"  intent:      {self.last_intent.intent} → {self.last_intent.skill or '(general)'} "
-                f"({self.last_intent.confidence:.2f}, {self.last_intent.classifier})"
+                f"[{self.last_intent.action}] ({self.last_intent.confidence:.2f}, "
+                f"{self.last_intent.classifier}, {self.last_intent.latency_ms}ms)"
             )
         if self.last_tool_selection is not None:
             selected = ", ".join(self.last_tool_selection.selected) or "(all tools)"
             print(f"  tool select: {selected}")
+            top = sorted(
+                self.last_tool_selection.probabilities.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:3]
+            if top:
+                print("  probabilities: " + ", ".join(f"{name}={prob:.2f}" for name, prob in top))
+            if self.last_tool_selection.events:
+                print("  select events: " + "; ".join(self.last_tool_selection.events))
         if "eval" in calls:
             n_evals = sum(1 for c in calls if c == "eval")
+            names = ", ".join(self.last_ptc_allowlist) or "(none)"
             print(
                 f"  invocation:  code interpreter — {n_evals} eval program(s), "
-                f"{len(self.last_ptc_allowlist)} tools on the PTC allowlist"
+                f"{len(self.last_ptc_allowlist)} tools on the PTC allowlist: {names}"
+            )
+        if self.last_hitl_decisions:
+            print(
+                "  hitl:        "
+                + ", ".join(str(decision.get("type")) for decision in self.last_hitl_decisions)
             )
 
     # -- workflows ----------------------------------------------------------

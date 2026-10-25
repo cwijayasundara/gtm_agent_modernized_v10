@@ -85,8 +85,17 @@ def run_with_hitl(
     payload: dict[str, Any],
     config: dict[str, Any],
     reviewer: Reviewer,
+    records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Invoke an agent and resume every human approval interrupt."""
+    """Invoke an agent and resume every human approval interrupt.
+
+    Args:
+        agent: Agent with a checkpointer when an interrupt occurs.
+        payload: Initial agent input.
+        config: Agent config, including the thread id.
+        reviewer: Callback that returns approve/reject decisions.
+        records: Optional list that receives each decision for telemetry.
+    """
 
     result = agent.invoke(payload, config=config)
     while result.get("__interrupt__"):
@@ -99,6 +108,8 @@ def run_with_hitl(
                 f"reviewer returned {len(decisions)} decisions for "
                 f"{len(action_requests)} actions"
             )
+        if records is not None:
+            records.extend(decisions)
         result = agent.invoke(
             Command(resume={"decisions": decisions}),
             config=config,

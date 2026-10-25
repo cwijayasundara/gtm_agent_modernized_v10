@@ -82,3 +82,13 @@ def test_approve_queues_once_and_reject_does_not():
     )
     runner._invoke(model, "Follow up on lead-1042.", pinned_skill="outbound-followup")
     assert tools._SLACK_DRAFTS == []
+
+
+def test_hitl_decisions_are_recorded():
+    tools.reset_fixtures()
+    model, _, _ = GTMSimulator().outbound_script("lead-1042", pinned=True)
+    runner = GTMAgentRunner(
+        approve=True, reviewer=AutoApprover(True), decision_backend="offline"
+    )
+    runner._invoke(model, "Follow up on lead-1042.", pinned_skill="outbound-followup")
+    assert [decision["type"] for decision in runner.last_hitl_decisions] == ["approve"]
