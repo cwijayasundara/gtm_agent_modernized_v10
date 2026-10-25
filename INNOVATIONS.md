@@ -1,15 +1,16 @@
 # Innovations in the Modernized GTM Agent
 
 A summary of the design contributions in this repo (`gtm_agent_modernized_v1.0`),
-which combines **four independently useful selection/invocation layers** in one
-working agent: skill-bound tool disclosure, optional LLM tool selection,
-programmatic tool calling, and defined invocation — plus per-query model
-routing and turn-budget latency engineering, all verifiable offline.
+which combines **five independently useful selection/invocation layers** plus a
+per-tool approval boundary in one working agent: skill-bound tool disclosure,
+OpenAI Decisions intent routing, conversation-aware tool selection, read-only
+programmatic tool calling, and defined invocation — plus per-query model routing
+and turn-budget latency engineering, all verifiable offline.
 
 The central claim is narrower than "all best practices": the repo is a working
 reference for **how to resolve user intent to a workflow, and a workflow to a
 small tool surface, without putting the entire catalog in the main model's
-context**. Section 1.0 makes that selection stack explicit; §10 lists what the
+context**. Section 1.0 makes that selection stack explicit; §11 lists what the
 pattern does *not* guarantee.
 
 ---
@@ -75,18 +76,20 @@ What the system prompt *does* control is call shape: batch independent lookups,
 do not re-read a pinned skill, gate before drafting, keep the final summary
 short. That is §4's latency policy, not tool selection.
 
-The four layers answer four different questions:
+The five layers answer five different questions:
 
 | Layer | Question | Mechanism | Where |
 |---|---|---|---|
 | 1. Skill binding | Which workflow/tool family applies? | description match + `include_tools` + deferral | `skills/*/SKILL.md` |
-| 2. LLM selector | Which few tools are relevant *now*? | separate structured-output tool-retrieval call | `build_tool_selector_agent` |
-| 3. Interpreter/PTC | How can many tool calls be composed cheaply? | one JS program calling allowlisted `tools.*` | `build_interpreter_agent` |
-| 4. Defined workflow | Can the model be removed entirely? | authored tool order | `gtm_agent/direct.py` |
+| 2. Intent router | Which workflow is this request? | OpenAI Decisions `Choice` + clarification predicate | `gtm_agent/intent.py` |
+| 3. Tool selection | Which few tools are relevant *now*? | conversation transcript + OpenAI Decisions | `gtm_agent/selection.py` |
+| 4. Interpreter/PTC | How can many read-only calls be composed? | one JS program calling allowlisted `tools.*` | `gtm_agent/ptc.py` |
+| 5. Defined workflow | Can the model be removed entirely? | authored tool order | `gtm_agent/direct.py` |
 
-Only layer 1 is mandatory. Layers 2–4 are independent knobs and compose via
-`build_routed_agent(..., extra_middleware=[…])`. None of them is an
-intent→tool switch inside the system prompt.
+Only layer 1 is mandatory. Layers 2–5 are independent knobs and compose via
+`build_routed_agent(..., extra_middleware=[…])`. Action tools are outside PTC
+and gated by `HumanInTheLoopMiddleware` (`gtm_agent/hitl.py`). None of this is
+an intent→tool switch inside the system prompt.
 
 ### 1.1 The two halves: a registry and a playbook
 
@@ -412,144 +415,120 @@ pick “which tool next?”.
   tools directly in the defined order and enforce the same gates (do-not-send,
   no-recent-touch, draft queueing for rep approval). The CLI exposes them as
   `python main.py direct lead|intel|prep …`.
-- The deep agents also ship two further shapes: the **code interpreter**
-  (`CodeInterpreterMiddleware` + PTC allowlist, below) and the **LLM tool
-  selector** (`LLMToolSelectorMiddleware`, §9).
+- The deep agents also ship two further shapes: the **read-only code
+  interpreter** (`CodeInterpreterMiddleware` + skill-derived PTC allowlist, §9)
+  and the **conversation-aware Decisions tool selector**
+  (`ConversationToolSelectionMiddleware`, §10).
 
 **Evidence.** `tests/smoke_test_defined_invocation.py` (gates + intel + prep run
 with zero model turns) and the `defined invocation` scenario in
 `python main.py test` both pass offline.
 
-## 8. Code interpreter: programmatic tool calling (PTC)
+## 8. Intent routing with OpenAI Decisions
+
+**Problem.** Skills describe when they apply, but nothing forces a request to a
+skill before the agent starts. A bad skill guess costs a whole run.
+
+**Innovation.** `IntentRouter` runs before the agent is built:
+
+- one OpenAI Decisions request with a `choice` over the runnable workflows and a
+  `needs_clarification` predicate;
+- confidence floor `0.65` and clarification threshold `0.6`;
+- high confidence → pin the skill;
+- low confidence or clarification-positive → ask for a target instead of
+  guessing;
+- API failure → deterministic keyword fallback;
+- `auto` adds a demo-fixture target resolver, so `"Follow up with lead-1042"` or
+  `"Prep me for Priya Sharma"` can run end to end.
+
+This is the hard intent layer the earlier version lacked. It is intentionally
+pre-flight, not middleware: the chosen skill determines the interpreter's PTC
+allowlist, and a clarification should stop before any model or tool call.
+
+**Evidence.** `tests/test_intent.py` covers high confidence, low confidence,
+API failure fallback, and target resolution. `python main.py intent "..."` and
+`python main.py auto "..."` exercise the same layer offline.
+
+## 9. Code interpreter: read-only PTC plus per-tool HITL
 
 **Problem.** Serial model-mediated tool calls: every tool call costs a full model
-round trip (tokens, latency, retry).
+round trip. Letting the interpreter call action tools makes the workflow cheaper
+but bypasses per-tool approval.
 
-**Innovation.** deepagents' interpreter lets the model compose tool calls in
-code. `CodeInterpreterMiddleware(ptc=[...])` installs an `eval` tool; the model
-authors a JS program; the harness bridges the allowlisted tools into
-`globalThis.tools.<camelCase>` and executes the program, returning
-`<result>...</result>`.
+**Innovation.** The interpreter is now a **read-only** execution surface:
 
-A whole GTM workflow then becomes one program. Offline, with the same scripted
-model, the outbound playbook's tool trace collapses from
-`read_file → check_contact_history → lookup_lead → web_search_company →
-draft_slack_followup` (4 tool-call turns) to a single `eval`:
+- the allowlist is derived from the selected skill's `include_tools`, filtered
+  by `side_effect` metadata (`gtm_agent/ptc.py`);
+- `draft_slack_followup` and `queue_followup_sequence` are never bridged;
+- the `eval` program gates, batches with `Promise.all`, and returns
+  `{draft, rationale}`;
+- the draft is then queued through the normal `draft_slack_followup` tool, where
+  `HumanInTheLoopMiddleware` can pause it per tool.
 
-| Run | Model turns | Tool-call turns |
-|---|---|---|
-| loop, unpinned skill | 6 | 5 |
-| loop, pinned skill | 5 | 4 |
-| interpreter, pinned skill | 2 | 1 (`eval`) |
+The outbound trace is `eval → draft_slack_followup`, not a single eval that also
+performs the side effect. That is the price of a real approval boundary. The
+prep failure is gone because its allowlist now includes `get_person_dossier` and
+`get_last_interaction`.
 
-The interpreter is an **invocation** layer, not a selection layer. The `ptc`
-list is a static allowlist; the normal tool surface is still bound, and the
-model chooses which `tools.*` calls to write and in what order. What changes is
-the topology: gating, `Promise.all`, dependent chaining and the side effect
-happen inside one runtime execution instead of four model round trips.
+**Evidence.** `tests/test_interpreter_flow.py` asserts the drafted lead emits
+`["eval", "draft_slack_followup"]`, the blocked lead emits `["eval"]`, and the
+prep evaluator can call its tools. `tests/test_hitl.py` proves rejection prevents
+execution.
 
-Two limits matter when copying this:
+## 10. Conversation-aware tool selection with OpenAI Decisions
 
-- PTC calls do not pass through the normal `ToolNode` / `interrupt_on` approval
-  path. In this repo that is acceptable only because `draft_slack_followup`
-  queues a `pending_approval` draft and never sends; if a bridged tool has a
-  real side effect, gate the `eval` tool itself or add approval middleware.
-- The allowlist must cover every tool the JS program uses.
-  `DEFAULT_INTERPRETER_PTC` currently omits `get_person_dossier` and
-  `get_last_interaction`, so `--interpreter prep` emits one `eval` that fails
-  with `TypeError: not a function`. The smoke scenario asserts that an `eval`
-  was emitted, not that it succeeded. Derive the allowlist from the selected
-  skill's `include_tools`, or keep per-workflow allowlists.
+**Problem.** The previous selector used the agent's main model and read only the
+last human message. A follow-up like “do that for the other account” had almost
+no context to select from.
 
-The JS program gates on `checkContactHistory`, batches `lookupLead` +
-`webSearchCompany` + `getGongTranscripts` with `Promise.all`, drafts, and
-queues for approval. The queued draft is asserted **byte-identical** to the
-loop version's, so the cheaper execution path does not change the outcome
-(only the number of model round trips).
+**Innovation.** `ConversationToolSelectionMiddleware` subclasses
+`decision_harness.ToolSelectionMiddleware`:
 
-**Evidence.** `tests/smoke_test_interpreter_ptc.py` (eval → PTC bridge → tool
-result) and the `interpreter PTC` scenario in `python main.py test` (one eval
-is emitted per workflow; outbound and intel execute successfully, blocked leads
-stay blocked, routing + interpreter compose). The prep script currently fails
-inside the eval for the allowlist reason above; the scenario asserts call
-shape, not eval success, so this is a documented gap rather than a passing
-claim.
+- renders recent user messages, assistant tool calls, and tool results;
+- asks OpenAI Decisions which candidate tools are relevant;
+- selects once per run, not on every model turn;
+- always keeps deepagents built-ins;
+- on timeout, refusal, circuit-open, malformed output, or “no tool clears the
+  threshold”, keeps the full tool set.
 
-## 9. LLM tool selection before the loop
+`decision_harness.ModelSelectionMiddleware` remains unchanged for model routing;
+the tool selector reuses its `ToolSelector` and `DecisionsClient` rather than
+forking the harness.
 
-**Problem.** Even inside the agent loop, a large toolset makes the next-tool
-decision harder and the prompt bigger.
+**Evidence.** `tests/test_selection.py` proves prior tool results reach the
+selector and failures keep all tools. `python main.py test` asserts the selected
+tool is bound and an unrelated tool is not.
 
-**Innovation.** `build_tool_selector_agent()` wires
-`langchain.agents.middleware.LLMToolSelectorMiddleware`: before **each model
-call**, a separate structured-output call sees the last human message plus the
-available tool descriptions, returns an ordered name list, and the middleware
-overrides `request.tools` so only those tools are bound for that call.
-`max_tools=3` in this app; `always_include` covers tools that must stay visible
-(e.g. `read_file` for skills).
-
-This is tool retrieval, not intent routing: it does not choose a workflow,
-rewrite the prompt, or decide call order. It is also not free context savings —
-the selector call itself carries the catalog's names and descriptions. The gain
-is a smaller, focused main-model request, paid for with one extra model call
-per turn.
-
-Two implementation details matter when copying it:
-
-- This repo passes `_make_model(model)` as the selector model, so the selector
-  is the **same model**, not a cheaper one, despite the docstring.
-- Selection is based only on the last `HumanMessage`, so generic follow-ups can
-  retrieve poorly. Conversation-aware selection or a deterministic pre-filter
-  is safer for chatty multi-turn use.
-
-Because the app pins the skill, the selector does not need to keep `read_file`.
-Without pinning, `always_include=["read_file", ...]` is required or the model
-can lose the ability to load the skill at all.
-
-**Evidence.** Offline scenario `tool selector` in `python main.py test`: the
-selector sees the full request catalog, selects one tool, and the agent loop
-then binds exactly that one tool (1 of 50) — asserted from the per-call
-bound-tool snapshot.
-
-The execution shapes are independent knobs and compose through
-`build_routed_agent(..., extra_middleware=[…])`. `main.py` wires
-`--route --interpreter --selector` together; the offline suite verifies
-routing+interpreter and selector separately, not that exact three-way
-combination end to end.
-
----
-
-## 10. Scope check: a strong reference, not “all best practices”
+## 11. Scope check: a strong reference, not “all best practices”
 
 The repo is a coherent reference implementation of the main techniques for
 keeping a many-tool agent focused:
 
-- resolve **intent to a skill** first, using skill descriptions rather than a
+- resolve **intent to a skill** first, using a decision model rather than a
   giant dispatch prompt;
 - disclose only that skill's **tool schemas**, rather than shipping the catalog;
-- optionally **retrieve a smaller tool subset** before each main model call;
-- optionally collapse invocation into a **code program** to remove serial round
+- **retrieve a smaller tool subset** from the conversation before the loop;
+- collapse read-only invocation into a **code program** to remove serial round
   trips;
+- put **action tools behind per-tool HITL**;
 - fall back to **deterministic invocation** when the workflow is stable.
 
 It is not a claim that every best practice is implemented, nor that the
-trade-offs are free. The explicit gaps:
+trade-offs are free. The remaining gaps:
 
 | Gap | Consequence |
 |---|---|
-| The selector is the same model and runs every turn | adds a selection call; latency/cost are not optimized |
-| Selector reads only the last human message | weak retrieval on conversational follow-ups |
-| `max_tools=3` can prune `read_file` | skill must be pinned, or `always_include` must protect infrastructure tools |
-| PTC allowlist is hand-maintained | drift breaks workflows; prep currently fails |
-| PTC bypasses per-tool HITL | safe here only because the final action queues, not sends |
+| Tool selection runs once per run | a mid-run intent change does not re-select tools |
+| `auto` target resolution uses demo fixtures only | it is not production NLU |
+| PTC cannot pause inside a running `eval` | action tools are kept outside PTC instead |
 | Disclosure is not authorization | a hallucinated exact tool name can still be invoked; use `SkillsMiddleware(tools=...)` for a hard gate |
-| No hard intent classifier | a wrong skill choice remains possible; add a router/eval if the cost of a miss is high |
-| The context floor is not zero | built-ins + 3 cross-workflow tools are visible on every call (11 schemas before disclosure) |
+| The context floor is not zero | built-ins + cross-workflow tools are visible on every call |
+| No end-to-end quality benchmark | selection is measured by visibility/call shape, not answer accuracy |
 
-The architectural point is the **separation of concerns**: intent lives in
-skill descriptions, exposure in `include_tools`, relevance in the selector,
-invocation in PTC/direct, and model choice in routing. That is the reusable
-lesson; "all best practices" is not.
+The architectural point is the **separation of concerns**: intent lives in the
+intent router, exposure in `include_tools`, relevance in the conversation-aware
+selector, invocation in PTC/direct, actions in HITL, and model choice in routing.
+That is the reusable lesson; “all best practices” is not.
 
 ## Honest-evidence note
 
@@ -558,7 +537,7 @@ configured defaults: all prices in `catalog_overlay.json` are explicit
 placeholders, and the `intelligence` scores are hand-assigned relative
 rankings, not benchmark results. Validate tier→model assignments against
 provider pricing pages and a small eval set before production. The selection
-stack is likewise a design pattern, not a quality benchmark: §1.6 and §8
+stack is likewise a design pattern, not a quality benchmark: §1.6, §9, and §10
 measure visibility and call shape, not end-to-end answer quality against a
 baseline.
 
@@ -567,7 +546,9 @@ baseline.
 | Concern | Where |
 |---|---|
 | Skills-bound agent, turn-budget prompt | `gtm_agent/agent.py`, `skills/*/SKILL.md` |
-| Intent → skill → tool selection semantics (§1.0) | `gtm_agent/agent.py`, `skills/*/SKILL.md`, deepagents `SkillsMiddleware` |
+| Intent → skill → tool selection semantics (§1.0, §8) | `gtm_agent/intent.py`, `skills/*/SKILL.md` |
+| Conversation-aware tool selection (§10) | `gtm_agent/selection.py` |
+| Read-only PTC allowlist + HITL (§9) | `gtm_agent/ptc.py`, `gtm_agent/hitl.py` |
 | 50-tool mock stack, `DEFERRED` marker | `gtm_agent/tools.py` |
 | Per-skill tool bindings (§1) | `skills/*/SKILL.md` (`metadata.include_tools`) |
 | Disclosure mechanism (§1.2–1.4) | `deepagents/middleware/skills.py`, `middleware/_skill_tools.py` (installed, 0.7.23) |
