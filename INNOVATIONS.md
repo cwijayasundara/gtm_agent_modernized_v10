@@ -1,9 +1,16 @@
 # Innovations in the Modernized GTM Agent
 
 A summary of the design contributions in this repo (`gtm_agent_modernized_v1.0`),
-which combines **three independently useful techniques** in one working agent:
-skills-bound tool disclosure, per-query LLM routing, and turn-budget latency
-engineering — all verifiable offline.
+which combines **four independently useful selection/invocation layers** in one
+working agent: skill-bound tool disclosure, optional LLM tool selection,
+programmatic tool calling, and defined invocation — plus per-query model
+routing and turn-budget latency engineering, all verifiable offline.
+
+The central claim is narrower than "all best practices": the repo is a working
+reference for **how to resolve user intent to a workflow, and a workflow to a
+small tool surface, without putting the entire catalog in the main model's
+context**. Section 1.0 makes that selection stack explicit; §10 lists what the
+pattern does *not* guarantee.
 
 ---
 
@@ -18,13 +25,12 @@ different workflow.
 (`extras={"defer_loading": True}`). Each skill's `SKILL.md` frontmatter
 declares the tools it owns via `metadata.include_tools`, and the deepagents
 `SkillsMiddleware` discloses a tool's schema to the model **only after the
-model reads the skill that lists it**. Before that, the tool call fails as
-unknown.
+model reads the skill that lists it**.
 
 Consequences:
 
-- A lead follow-up run never sees the 38 tools owned by the other skills —
-  context savings and capability gating scale with the tool count.
+- A lead follow-up run never sees the 35 tools owned by the other skills
+  (context savings and capability gating scale with the tool count).
 - One skill (`competitor-analysis`) is *methodology-only*: it binds zero
   tools and rides on the model's own knowledge, showing the spectrum from
   tool-bound to knowledge-only skills.
@@ -32,6 +38,283 @@ Consequences:
   using a scripted `GenericFakeChatModel`: it snapshots the bound tool list on
   every model call and asserts deferred schemas are disclosed only after the
   `SKILL.md` is read — no API key required.
+
+### 1.0 Intent is matched to a skill, not to a tool
+
+The system prompt is not a 50-way dispatch table. `GTM_SYSTEM_PROMPT` is a
+**policy prompt**: workflow order, safety gates, approval semantics, and turn
+budget. Its only routing instruction is "Load the matching skill before
+acting" (`gtm_agent/agent.py:48-75`). The `build_*` functions are not separate
+per-intent agents; they configure the same graph with different middleware.
+
+The intent → tool path is:
+
+```
+user intent
+  │
+  ├─ 1. skill match ......... model compares the task with injected SKILL.md
+  │                            descriptions ("Trigger on: new lead, follow-up…")
+  ├─ 2. skill load .......... read_file / pinned_skills loads the playbook
+  ├─ 3. tool disclosure ..... metadata.include_tools undefer only that skill's
+  │                            tools (SkillsMiddleware)
+  ├─ 4. tool choice ......... model picks among the disclosed schemas
+  └─ 5. invocation .......... normal tool call, JS/PTC program, or direct call
+```
+
+The intent signal is the skill **description**, not a branch in the prompt.
+`outbound-followup` triggers on "new lead, inbound lead, follow-up, outreach,
+email draft…" and owns 12 tools; `account-intelligence` triggers on "account
+review, expansion opportunity, deal risk, renewal…" and owns 15;
+`meeting-prep` triggers on "meeting prep, discovery call, QBR prep…" and owns
+8. `SkillsMiddleware` injects those descriptions and tells the model to match
+the task against them.
+`metadata.include_tools` then supplies the tool family. This is semantic
+routing done by the model, with a deterministic disclosure rule underneath.
+
+What the system prompt *does* control is call shape: batch independent lookups,
+do not re-read a pinned skill, gate before drafting, keep the final summary
+short. That is §4's latency policy, not tool selection.
+
+The four layers answer four different questions:
+
+| Layer | Question | Mechanism | Where |
+|---|---|---|---|
+| 1. Skill binding | Which workflow/tool family applies? | description match + `include_tools` + deferral | `skills/*/SKILL.md` |
+| 2. LLM selector | Which few tools are relevant *now*? | separate structured-output tool-retrieval call | `build_tool_selector_agent` |
+| 3. Interpreter/PTC | How can many tool calls be composed cheaply? | one JS program calling allowlisted `tools.*` | `build_interpreter_agent` |
+| 4. Defined workflow | Can the model be removed entirely? | authored tool order | `gtm_agent/direct.py` |
+
+Only layer 1 is mandatory. Layers 2–4 are independent knobs and compose via
+`build_routed_agent(..., extra_middleware=[…])`. None of them is an
+intent→tool switch inside the system prompt.
+
+### 1.1 The two halves: a registry and a playbook
+
+The feature is a contract between code and markdown, and neither half is
+useful alone.
+
+```python
+# gtm_agent/tools.py — the registry says "this schema is withheld"
+DEFERRED = {"defer_loading": True}
+
+@tool(extras=DEFERRED)
+def check_contact_history(lead_id: str) -> str:
+    """Check whether a teammate already reached out to this lead/account recently..."""
+```
+
+```yaml
+# skills/outbound-followup/SKILL.md — the playbook says "what I need"
+metadata:
+  include_tools: lookup_lead check_contact_history get_gong_transcripts
+```
+
+`defer_loading` is not a repo convention: it is a documented field of the
+tool definition (it passes through `langchain_anthropic` to the provider), and
+deepagents uses the same key in `extras` to decide what to withhold. The agent
+is still built with the whole catalog — nothing is unregistered:
+
+```python
+# gtm_agent/agent.py
+return create_deep_agent(
+    model=_make_model(model),
+    tools=tools.ALL_TOOLS,          # all 50 registered
+    skills=["/skills/"],            # wires SkillsMiddleware
+    backend=FilesystemBackend(root_dir=PROJECT_ROOT),
+)
+```
+
+The withholding happens per **model call**, in middleware, not at
+tool-registration time.
+
+### 1.2 The flow, end to end
+
+Build time — nothing is hidden yet; the flag is only carried:
+
+```
+  gtm_agent/tools.py                           skills/outbound-followup/SKILL.md
+  ┌─────────────────────────────────────┐      ┌────────────────────────────────┐
+  │ ALL_TOOLS (50)                      │      │ metadata:                      │
+  │   3  always available               │      │    include_tools: lookup_lead  │
+  │  47  deferred                       │      │      check_contact_history ... │
+  │      extras={"defer_loading": True} │      │                                │
+  └────────────────┬────────────────────┘      └──────────────┬─────────────────┘
+                   │                                          │
+                   └────────────────────┬─────────────────────┘
+                                        ▼
+          create_deep_agent(tools=tools.ALL_TOOLS, skills=["/skills/"])
+                                        │
+                                        ▼
+          ┌────────────────────────────────────────────────────────────────┐
+          │ all 50 tools stay registered on the agent                      │
+          │ SkillsMiddleware is placed in the graph, before prompt caching │
+          └────────────────────────────────────────────────────────────────┘
+```
+
+Per model call — the middleware decides what leaves the process:
+
+```
+   conversation state: messages + the 50 registered tools
+                     │
+                     ▼
+  ┌────────────────────────────────────────────────────────────────────────────┐
+  │ SkillsMiddleware.wrap_model_call                                           │
+  │                                                                            │
+  │  1 _find_skill_reads ──► did the model read a SKILL.md that lists tools?   │
+  │       │                                                                    │
+  │  2 _plan_disclosure ──► match each include_tools name to a registered      │
+  │       │                 deferred tool; anchor it at the earliest such read │
+  │  3 _bind_disclosures ─► disclosed: drop "defer_loading"                    │
+  │       │                 others:   keep "defer_loading"                     │
+  │  4 record {tool → include name} in `_skill_tools_disclosed`                │
+  └──────────────────┬──────────────────────────┬──────────────────────────────┘
+                     │                          │
+                     no read: 47 deferred       read: +12 undeferred
+                     ▼                          ▼
+                     11 schemas shipped         23 schemas shipped
+```
+
+The run as the model experiences it:
+
+```
+  MODEL CALL 1                                    11 schemas shipped
+  ┌────────────────────────────────────────────────────────────────┐
+  │ user: "Follow up on lead-1042."                                │
+  │ → read_file("/skills/outbound-followup/SKILL.md")              │
+  └──────────────────────────────┬─────────────────────────────────┘
+                                 ▼   ToolMessage: frontmatter + the ordered checklist
+
+  ── middleware now finds the read → the 12 names are undeferred ──
+
+  MODEL CALL 2                                    23 schemas shipped
+  ┌────────────────────────────────────────────────────────────────┐
+  │ → check_contact_history("lead-1042")     ← invisible on call 1 │
+  └──────────────────────────────┬─────────────────────────────────┘
+                                 ▼   ToolMessage: no do-not-send flag, no prior touch
+
+  MODEL CALL 3                                    23 schemas shipped
+  ┌────────────────────────────────────────────────────────────────┐
+  │ → lookup_lead · web_search_company · draft_slack_followup …    │
+  └────────────────────────────────────────────────────────────────┘
+      (the 35 tools owned by intel / health / prep stay deferred throughout)
+```
+
+And the reverse — disclosure is anchored to a position in the transcript, so it
+can be lost:
+
+```
+  compaction evicts /skills/outbound-followup/SKILL.md from the transcript
+  │
+  ▼
+  _find_skill_reads finds no read → the 12 tools go dark again
+  │
+  ▼
+  11 schemas shipped, 47 deferred
+  (the playbook left the context, so the capability it carried left too)
+```
+
+### 1.3 What happens on each model call
+
+`SkillsMiddleware.wrap_model_call` (deepagents 0.7.23, `middleware/skills.py`
+→ `middleware/_skill_tools.py`) runs this pipeline before the provider is
+called:
+
+1. **Find skill reads.** `_find_skill_reads` scans the conversation for a
+   *successful* `read_file` result whose path resolves to a discovered
+   `SKILL.md` that declares tools. Any `offset`/`limit` counts, and so does
+   content that was later truncated — only the call and the result's status
+   are inspected. A *pinned* skill message counts too.
+2. **Resolve include names.** Each name in the read skills'
+   `metadata.include_tools` is matched against the tools bound to the request.
+   In this repo every name matches, so disclosure goes through the *deferred*
+   path and no middleware-side tool resolver is needed.
+3. **Anchor the disclosure.** `_plan_disclosure` records the **earliest** read
+   that produced each tool. Disclosure is *positional*, not global: a tool
+   becomes callable from the point in the transcript where its skill was read.
+4. **Undefer.** `_bind_disclosures` copies those tools with the
+   `defer_loading` key removed, so their schemas are sent on this call onward.
+   The other 35 deferred tools keep the key and stay dark.
+5. **Record and gate.** The `{tool name → include name}` map is checkpointed in
+   private state (`_skill_tools_disclosed`), so the tool node can resolve a
+   call that arrived from an inline disclosure.
+
+Placement matters and `create_deep_agent` handles it: the middleware sits
+*after* compaction, model fallback and routing (so it sees the conversation the
+model actually receives) and *before* prompt caching.
+
+### 1.4 How the schema actually reaches the model
+
+deepagents picks one of two transports per model:
+
+| Model family | Transport |
+|---|---|
+| Anthropic `claude-opus-5`, `claude-fable-5`, `claude-mythos-5`, `claude-opus-4-8` | Mid-conversation `tool_addition` block carrying the full `tool_definition` |
+| OpenAI `gpt-6-*`, `gpt-5.6-*` (Responses API only) | `additional_tools` input item |
+| Anything else — including this repo's default `claude-haiku-5-5` | Fallback: the tool is bound in `tools` **without** `defer_loading`, so its schema simply appears in the tool list from that call on |
+
+The fallback is why the feature is portable: an unsupported provider still
+gets correct behaviour, it just pays the schema in `tools` instead of inline.
+Two provider-specific guards apply on the inline path — a tool whose input
+schema has a root `oneOf`/`anyOf`/`allOf` is *not* disclosed (Anthropic rejects
+it) but logged as a warning, and the disclosure is inserted only after a
+tool-result batch or a human turn so message ordering stays valid.
+
+Because disclosure is anchored to a position in the transcript, it lives only
+as long as that read stays in context: compaction can evict the `SKILL.md` and
+the tool goes dark again. That is the mechanical reason the turn-budget prompt
+(§4) forbids re-reading a pinned skill.
+
+### 1.5 Tool inventory
+
+| Bucket | Tools | Mode |
+|---|---|---|
+| deepagents built-ins | `read_file` `write_file` `edit_file` `ls` `glob` `grep` `delete` `task` | always visible |
+| cross-workflow | `list_pending_drafts` `get_current_date` `search_internal_wiki` | always visible |
+| `outbound-followup` | 12 (CRM, engagement, drafting) | deferred |
+| `account-intelligence` | 15 (usage, hiring, funding, market) | deferred |
+| `customer-health` | 12 (support, renewals, adoption) | deferred |
+| `meeting-prep` | 8 (relationship context) | deferred |
+| `competitor-analysis` | 0 — methodology only | n/a |
+| **Total GTM** | **50** (47 deferred + 3 always) | |
+
+`len(ALL_TOOLS) == 50` is asserted at import (`gtm_agent/tools.py`) and again
+in `main.py`, so the inventory cannot drift silently.
+
+### 1.6 Measured effect
+
+From the smoke test's per-call snapshot (58 bound = 50 GTM + 8 built-ins):
+
+| Model call | Bound | Still deferred | Model can see |
+|---|---|---|---|
+| 1 — before any skill read | 58 | 47 | 11 (8 built-ins + 3 cross-workflow) |
+| 2 — after reading `outbound-followup/SKILL.md` | 58 | 35 | 23 (11 + the 12 outbound tools) |
+
+The count of *bound* tools never changes — only the number of schemas actually
+shipped. The 12 tools that appeared are exactly the ones the read skill lists;
+the 35 owned by account-intelligence, customer-health and meeting-prep stayed
+deferred, which the test asserts explicitly (`isdisjoint` for the newly
+disclosed set, `issubset` for the unrelated set).
+
+### 1.7 Boundary conditions
+
+Worth stating plainly, because the marketing version of this feature
+overclaims:
+
+- **Disclosure is a visibility control, not an authorization control.** The
+tool is still registered on the agent, so a model that hallucinated the exact
+name and arguments *could* invoke it — the smoke test's scripted model does
+exactly that and the call succeeds. What deferral really buys is that a
+well-behaved provider cannot emit a well-formed call for a schema it was never
+shown. For a hard capability boundary, register the tool with
+`SkillsMiddleware(tools=...)` instead of `create_deep_agent(tools=...)`: that
+is the *gated* path, where calls to an undisclosed tool fail as unknown.
+- **Name matching is exact.** A typo in `include_tools` does not raise; it logs
+  at debug and the tool silently never appears. `include_tools` must also be a
+  space-separated *string*: a YAML list is warned about and stringified to
+  `"['a', 'b']"`, whose names never match a tool — the skill then discloses
+  nothing.
+- **The GTM-specific floor is 11 tools.** Built-ins plus the cross-workflow
+  three are visible on every call. That floor, not the 50-tool catalog, is what
+  a follow-up run actually costs.
 
 ## 2. Per-query LLM routing via middleware (`decision_harness`)
 
@@ -86,7 +369,9 @@ system prompt and skills encode an explicit **turn economy**:
 - pinned `SKILL.md` content is never re-read
 
 This treats prompt engineering as **latency engineering**, with the
-telemetry ledger (§3) available to verify the budget is actually met.
+telemetry ledger (§3) available to verify the budget is actually met. It is
+call-shape policy, not intent routing: by the time these rules apply, layer 1
+(skill disclosure) or layer 2 (selector) has already narrowed the tool surface.
 
 ## 5. Guardrails by workflow design (human-in-the-loop)
 
@@ -157,6 +442,25 @@ draft_slack_followup` (4 tool-call turns) to a single `eval`:
 | loop, pinned skill | 5 | 4 |
 | interpreter, pinned skill | 2 | 1 (`eval`) |
 
+The interpreter is an **invocation** layer, not a selection layer. The `ptc`
+list is a static allowlist; the normal tool surface is still bound, and the
+model chooses which `tools.*` calls to write and in what order. What changes is
+the topology: gating, `Promise.all`, dependent chaining and the side effect
+happen inside one runtime execution instead of four model round trips.
+
+Two limits matter when copying this:
+
+- PTC calls do not pass through the normal `ToolNode` / `interrupt_on` approval
+  path. In this repo that is acceptable only because `draft_slack_followup`
+  queues a `pending_approval` draft and never sends; if a bridged tool has a
+  real side effect, gate the `eval` tool itself or add approval middleware.
+- The allowlist must cover every tool the JS program uses.
+  `DEFAULT_INTERPRETER_PTC` currently omits `get_person_dossier` and
+  `get_last_interaction`, so `--interpreter prep` emits one `eval` that fails
+  with `TypeError: not a function`. The smoke scenario asserts that an `eval`
+  was emitted, not that it succeeded. Derive the allowlist from the selected
+  skill's `include_tools`, or keep per-workflow allowlists.
+
 The JS program gates on `checkContactHistory`, batches `lookupLead` +
 `webSearchCompany` + `getGongTranscripts` with `Promise.all`, drafts, and
 queues for approval. The queued draft is asserted **byte-identical** to the
@@ -165,8 +469,11 @@ loop version's, so the cheaper execution path does not change the outcome
 
 **Evidence.** `tests/smoke_test_interpreter_ptc.py` (eval → PTC bridge → tool
 result) and the `interpreter PTC` scenario in `python main.py test` (one eval
-per workflow for outbound / intel / prep, blocked leads stay blocked,
-routing + interpreter compose).
+is emitted per workflow; outbound and intel execute successfully, blocked leads
+stay blocked, routing + interpreter compose). The prep script currently fails
+inside the eval for the allowlist reason above; the scenario asserts call
+shape, not eval success, so this is a documented gap rather than a passing
+claim.
 
 ## 9. LLM tool selection before the loop
 
@@ -174,22 +481,75 @@ routing + interpreter compose).
 decision harder and the prompt bigger.
 
 **Innovation.** `build_tool_selector_agent()` wires
-`langchain.agents.middleware.LLMToolSelectorMiddleware`: a (cheap) model call
-picks the relevant tool names from the catalog *before* the loop runs, and only
-those are bound for the agent model. `always_include` covers tools that must
-stay visible (e.g. `read_file` for skills).
+`langchain.agents.middleware.LLMToolSelectorMiddleware`: before **each model
+call**, a separate structured-output call sees the last human message plus the
+available tool descriptions, returns an ordered name list, and the middleware
+overrides `request.tools` so only those tools are bound for that call.
+`max_tools=3` in this app; `always_include` covers tools that must stay visible
+(e.g. `read_file` for skills).
+
+This is tool retrieval, not intent routing: it does not choose a workflow,
+rewrite the prompt, or decide call order. It is also not free context savings —
+the selector call itself carries the catalog's names and descriptions. The gain
+is a smaller, focused main-model request, paid for with one extra model call
+per turn.
+
+Two implementation details matter when copying it:
+
+- This repo passes `_make_model(model)` as the selector model, so the selector
+  is the **same model**, not a cheaper one, despite the docstring.
+- Selection is based only on the last `HumanMessage`, so generic follow-ups can
+  retrieve poorly. Conversation-aware selection or a deterministic pre-filter
+  is safer for chatty multi-turn use.
+
+Because the app pins the skill, the selector does not need to keep `read_file`.
+Without pinning, `always_include=["read_file", ...]` is required or the model
+can lose the ability to load the skill at all.
 
 **Evidence.** Offline scenario `tool selector` in `python main.py test`: the
-selector sees the full catalog, selects one tool, and the agent loop then binds
-exactly that one tool (1 of 50) — asserted from the per-call bound-tool
-snapshot.
+selector sees the full request catalog, selects one tool, and the agent loop
+then binds exactly that one tool (1 of 50) — asserted from the per-call
+bound-tool snapshot.
 
-The three invocation shapes are independent knobs and compose through
-`build_routed_agent(..., extra_middleware=[…])`. With `--route --interpreter
---selector` the run is routed, one tool (`eval`) is bound, and the whole
-outbound playbook executes as one program — verified offline.
+The execution shapes are independent knobs and compose through
+`build_routed_agent(..., extra_middleware=[…])`. `main.py` wires
+`--route --interpreter --selector` together; the offline suite verifies
+routing+interpreter and selector separately, not that exact three-way
+combination end to end.
 
 ---
+
+## 10. Scope check: a strong reference, not “all best practices”
+
+The repo is a coherent reference implementation of the main techniques for
+keeping a many-tool agent focused:
+
+- resolve **intent to a skill** first, using skill descriptions rather than a
+  giant dispatch prompt;
+- disclose only that skill's **tool schemas**, rather than shipping the catalog;
+- optionally **retrieve a smaller tool subset** before each main model call;
+- optionally collapse invocation into a **code program** to remove serial round
+  trips;
+- fall back to **deterministic invocation** when the workflow is stable.
+
+It is not a claim that every best practice is implemented, nor that the
+trade-offs are free. The explicit gaps:
+
+| Gap | Consequence |
+|---|---|
+| The selector is the same model and runs every turn | adds a selection call; latency/cost are not optimized |
+| Selector reads only the last human message | weak retrieval on conversational follow-ups |
+| `max_tools=3` can prune `read_file` | skill must be pinned, or `always_include` must protect infrastructure tools |
+| PTC allowlist is hand-maintained | drift breaks workflows; prep currently fails |
+| PTC bypasses per-tool HITL | safe here only because the final action queues, not sends |
+| Disclosure is not authorization | a hallucinated exact tool name can still be invoked; use `SkillsMiddleware(tools=...)` for a hard gate |
+| No hard intent classifier | a wrong skill choice remains possible; add a router/eval if the cost of a miss is high |
+| The context floor is not zero | built-ins + 3 cross-workflow tools are visible on every call (11 schemas before disclosure) |
+
+The architectural point is the **separation of concerns**: intent lives in
+skill descriptions, exposure in `include_tools`, relevance in the selector,
+invocation in PTC/direct, and model choice in routing. That is the reusable
+lesson; "all best practices" is not.
 
 ## Honest-evidence note
 
@@ -197,14 +557,20 @@ The routing *mechanism* is measured (§3), but the catalog **contents** are
 configured defaults: all prices in `catalog_overlay.json` are explicit
 placeholders, and the `intelligence` scores are hand-assigned relative
 rankings, not benchmark results. Validate tier→model assignments against
-provider pricing pages and a small eval set before production.
+provider pricing pages and a small eval set before production. The selection
+stack is likewise a design pattern, not a quality benchmark: §1.6 and §8
+measure visibility and call shape, not end-to-end answer quality against a
+baseline.
 
 ## File map
 
 | Concern | Where |
 |---|---|
 | Skills-bound agent, turn-budget prompt | `gtm_agent/agent.py`, `skills/*/SKILL.md` |
-| 50-tool mock stack, deferred loading | `gtm_agent/tools.py` |
+| Intent → skill → tool selection semantics (§1.0) | `gtm_agent/agent.py`, `skills/*/SKILL.md`, deepagents `SkillsMiddleware` |
+| 50-tool mock stack, `DEFERRED` marker | `gtm_agent/tools.py` |
+| Per-skill tool bindings (§1) | `skills/*/SKILL.md` (`metadata.include_tools`) |
+| Disclosure mechanism (§1.2–1.4) | `deepagents/middleware/skills.py`, `middleware/_skill_tools.py` (installed, 0.7.23) |
 | Routing middleware, telemetry, ledger | `gtm_agent/routing.py` |
 | Catalog overlay (data, not code) | `gtm_agent/catalog_overlay.json` |
 | Disclosure smoke test (offline) | `tests/smoke_test_skill_tools.py` |

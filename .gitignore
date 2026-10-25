@@ -14,8 +14,3 @@ out/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
-
-# Node tooling artifacts (agent harness)
-node_modules/
-package.json
-package-lock.json

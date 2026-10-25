@@ -236,7 +236,7 @@ def _make_tool(name: str, description: str, fixture_fn: Callable[[str], Any] | N
     return tool(name, description=description, extras=DEFERRED)(_impl)
 
 
-# --- outbound-followup additions (4) ---
+# --- outbound-followup (7) ---
 search_linkedin_profile = _make_tool(
     "search_linkedin_profile",
     "Look up a contact's LinkedIn profile: role history, recent posts, and shared connections.",
