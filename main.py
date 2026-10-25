@@ -28,10 +28,19 @@ from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
 
 from gtm_agent import direct, tools
 from gtm_agent.agent import build_agent
+from gtm_agent.decisions import decision_env, make_tool_selector, resolve_backend
+from gtm_agent.hitl import CliApprover, interrupt_config, run_with_hitl
+from gtm_agent.ptc import ptc_allowlist
 from gtm_agent.routing import RoutingTelemetry
+from gtm_agent.selection import (
+    INFRASTRUCTURE_TOOLS,
+    ConversationToolSelectionMiddleware,
+)
+from gtm_agent.skills import skill_tool_names
 from gtm_agent.simulator import (  # noqa: F401  # re-exported for the scenario tests
     _BOUND,
     _disclosed_skill_tools,
@@ -72,14 +81,35 @@ class GTMAgentRunner:
     by `LLMToolSelectorMiddleware` via `build_tool_selector_agent`.
     """
 
-    def __init__(self, live: bool = False, routed: bool = False, interpreter: bool = False, selector: bool = False) -> None:
+    def __init__(
+        self,
+        live: bool = False,
+        routed: bool = False,
+        interpreter: bool = False,
+        selector: bool = False,
+        *,
+        decision_backend: str = "auto",
+        approve: bool = False,
+        reviewer: Any | None = None,
+        tool_selector: Any | None = None,
+    ) -> None:
         self.live = live
         self.routed = routed
         self.interpreter = interpreter
         self.selector = selector
+        self.decision_backend = decision_backend
+        self.approve = approve
+        self.reviewer = reviewer or CliApprover()
         self.telemetry = RoutingTelemetry()
         self._thread_n = 0
         self.drafts: list[tuple[str, str, str]] = []  # (lead_id, draft, rationale)
+        self.last_tool_selection: Any | None = None
+        self.last_ptc_allowlist: list[str] = []
+        self.last_intent: Any | None = None
+        self._resolved_backend = resolve_backend(decision_backend) if selector else None
+        self._tool_selector = tool_selector
+        if self.selector and self._tool_selector is None:
+            self._tool_selector = make_tool_selector(decision_backend)
 
     # -- shared plumbing ----------------------------------------------------
 
@@ -93,45 +123,82 @@ class GTMAgentRunner:
         payload: dict[str, Any] = {"messages": [HumanMessage(content=prompt)]}
         if pinned_skill:
             payload["pinned_skills"] = [pinned_skill]
+
+        extra: list[Any] = []
+        selector_middleware: ConversationToolSelectionMiddleware | None = None
+        if self.selector:
+            max_tools = (
+                None
+                if self._resolved_backend == "offline"
+                else int(decision_env("GTM_TOOL_SELECTION_MAX_TOOLS", "6"))
+            )
+            selector_middleware = ConversationToolSelectionMiddleware(
+                selector=self._tool_selector,
+                candidate_names=set(skill_tool_names(pinned_skill)) or None,
+                always_include=list(INFRASTRUCTURE_TOOLS),
+                max_tools=max_tools,
+            )
+            extra.append(selector_middleware)
+
+        self.last_ptc_allowlist = ptc_allowlist(pinned_skill) if self.interpreter else []
+        interrupt_on = interrupt_config(self.approve)
+        checkpointer = InMemorySaver() if self.approve else None
+
         if self.routed:
             from gtm_agent.routing import AVAILABLE_LABELS, build_routed_agent
 
             override = {label: model for label in AVAILABLE_LABELS} if model is not None else None
-            extra: list[Any] = []
-            prompt = None
+            prompt_override = None
             if self.interpreter:
-                from gtm_agent.agent import GTM_INTERPRETER_SYSTEM_PROMPT, interpreter_middleware
+                from gtm_agent.agent import (
+                    GTM_INTERPRETER_SYSTEM_PROMPT,
+                    interpreter_middleware,
+                )
 
-                extra = [interpreter_middleware()]
-                prompt = GTM_INTERPRETER_SYSTEM_PROMPT
-            if self.selector:
-                from langchain.agents.middleware import LLMToolSelectorMiddleware
-
-                max_tools = len(model.selected) if isinstance(model, SelectorScriptedModel) else 3
-                extra = [
-                    *extra,
-                    LLMToolSelectorMiddleware(model=model, max_tools=max_tools or None),
-                ]
+                extra = [interpreter_middleware(self.last_ptc_allowlist), *extra]
+                prompt_override = GTM_INTERPRETER_SYSTEM_PROMPT
             agent = build_routed_agent(
                 self.telemetry,
                 models_override=override,
                 extra_middleware=extra,
-                system_prompt=prompt,
+                system_prompt=prompt_override,
+                interrupt_on=interrupt_on,
+                checkpointer=checkpointer,
             )
             config = {"recursion_limit": 60, "configurable": {"thread_id": thread_id}}
-            return agent.invoke(payload, config=config)
-        if self.interpreter:
+        elif self.interpreter:
             from gtm_agent.agent import build_interpreter_agent
 
-            agent = build_interpreter_agent(model=model)
-        elif self.selector:
-            from gtm_agent.agent import build_tool_selector_agent
-
-            max_tools = len(model.selected) if isinstance(model, SelectorScriptedModel) else 3
-            agent = build_tool_selector_agent(model=model, max_tools=max_tools or None)
+            agent = build_interpreter_agent(
+                model=model,
+                skill=pinned_skill,
+                ptc=self.last_ptc_allowlist,
+                extra_middleware=extra,
+                interrupt_on=interrupt_on,
+                checkpointer=checkpointer,
+            )
+            config = {"recursion_limit": 40, "configurable": {"thread_id": thread_id}}
         else:
-            agent = build_agent(model=model) if model is not None else build_agent()
-        return agent.invoke(payload, config={"recursion_limit": 40})
+            agent = build_agent(
+                model=model,
+                extra_middleware=extra,
+                interrupt_on=interrupt_on,
+                checkpointer=checkpointer,
+            ) if model is not None else build_agent(
+                extra_middleware=extra,
+                interrupt_on=interrupt_on,
+                checkpointer=checkpointer,
+            )
+            config = {"recursion_limit": 40, "configurable": {"thread_id": thread_id}}
+
+        result = (
+            run_with_hitl(agent, payload, config, self.reviewer)
+            if self.approve
+            else agent.invoke(payload, config=config)
+        )
+        if selector_middleware is not None:
+            self.last_tool_selection = selector_middleware.last
+        return result
 
     def _maybe_selector(self, model: ScriptedModel) -> Any:
         """Wrap an offline script as a selector-capable model when --selector is on."""
@@ -165,21 +232,26 @@ class GTMAgentRunner:
         path.write_text(content)
         return path
 
-    @staticmethod
-    def _print_footer(result: dict[str, Any]) -> None:
+    def _print_footer(self, result: dict[str, Any]) -> None:
         calls = _tool_call_sequence(result)
         if _BOUND:
             baseline = {n for n, d in _BOUND[0] if not d}
             skill_tools = {n for n, d in _BOUND[-1] if not d} - baseline
             print(f"  tools bound: {len(_BOUND[0])} | skill tools disclosed: {len(skill_tools)} | hidden: {50 - len(skill_tools)}")
         print(f"  tool trace:  {' → '.join(calls) if calls else '(none)'}")
+        if self.last_intent is not None:
+            print(
+                f"  intent:      {self.last_intent.intent} → {self.last_intent.skill or '(general)'} "
+                f"({self.last_intent.confidence:.2f}, {self.last_intent.classifier})"
+            )
+        if self.last_tool_selection is not None:
+            selected = ", ".join(self.last_tool_selection.selected) or "(all tools)"
+            print(f"  tool select: {selected}")
         if "eval" in calls:
-            from gtm_agent.agent import DEFAULT_INTERPRETER_PTC
-
             n_evals = sum(1 for c in calls if c == "eval")
             print(
                 f"  invocation:  code interpreter — {n_evals} eval program(s), "
-                f"{len(DEFAULT_INTERPRETER_PTC)} tools on the PTC allowlist"
+                f"{len(self.last_ptc_allowlist)} tools on the PTC allowlist"
             )
 
     # -- workflows ----------------------------------------------------------
@@ -458,7 +530,7 @@ class GTMAgentTestRunner:
         result = GTMAgentRunner(interpreter=True)._invoke(model, "Follow up on lead-1042.", pinned_skill="outbound-followup")
         calls = _tool_call_sequence(result)
         assert outcome == "drafted"
-        assert calls == ["eval"], f"expected one eval program, got {calls}"
+        assert calls == ["eval", "draft_slack_followup"], f"expected eval + draft, got {calls}"
         assert len(tools._SLACK_DRAFTS) == 1, "eval program did not queue a draft"
         queued = tools._SLACK_DRAFTS[0]
         assert queued["status"] == "pending_approval"
@@ -493,35 +565,48 @@ class GTMAgentTestRunner:
         routed = GTMAgentRunner(routed=True, interpreter=True)
         model, _, _ = GTMSimulator().interpreter_outbound_script("lead-1042", pinned=True)
         result = routed._invoke(model, "Follow up on lead-1042.", pinned_skill="outbound-followup")
-        assert _tool_call_sequence(result) == ["eval"]
+        assert _tool_call_sequence(result) == ["eval", "draft_slack_followup"]
         assert routed.telemetry.ledger is not None and routed.telemetry.ledger.entries
 
         self._record(
             "interpreter PTC",
             True,
-            "1 eval per workflow; same gates + identical draft as the loop playbook.",
+            "read-only eval + HITL-gated draft; same gates as the loop playbook.",
         )
 
     def test_tool_selector(self) -> None:
         """Tool selector: the agent loop only sees the tools the selector picked."""
         tools.reset_fixtures()
-        model = SelectorScriptedModel(
+        from decision_harness import ToolSelection
+
+        class _StubSelector:
+            def select(self, task, tool_pairs, **kwargs):
+                return ToolSelection(
+                    selected=["check_contact_history"],
+                    probabilities={"check_contact_history": 0.9},
+                )
+
+        model = ScriptedModel(
             messages=iter(
                 [
                     _call("check_contact_history", {"lead_id": "lead-1042"}, "c1"),
                     AIMessage(content="Checked history."),
                 ]
-            ),
-            selected=["check_contact_history"],
+            )
         )
-        result = GTMAgentRunner(selector=True)._invoke(model, "Follow up on lead-1042.")
+        result = GTMAgentRunner(
+            selector=True,
+            tool_selector=_StubSelector(),
+            decision_backend="offline",
+        )._invoke(model, "Follow up on lead-1042.", pinned_skill="outbound-followup")
         bound = {name for name, _deferred in _BOUND[-1]}
-        assert bound == {"check_contact_history"}, f"selector did not narrow the toolset: {sorted(bound)}"
+        assert "check_contact_history" in bound, f"selector did not bind the chosen tool: {sorted(bound)}"
+        assert "lookup_lead" not in bound, f"selector kept unrelated tools: {sorted(bound)}"
         assert _tool_call_sequence(result) == ["check_contact_history"]
         self._record(
             "tool selector",
             True,
-            f"LLM selector bound {len(bound)} of 50 tools (chosen before the loop).",
+            f"Decisions selector bound {len(bound)} tools including built-ins.",
         )
 
     @staticmethod

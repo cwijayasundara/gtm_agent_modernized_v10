@@ -109,8 +109,9 @@ _INTERPRETER_OUTBOUND_JS = '''(async () => {
   const rationale = isCustomer
     ? "Customer → expansion angle, anchored on usage growth and stated needs."
     : "Cold → brief, research-backed opener referencing their AI push and hiring.";
-  await tools.draftSlackFollowup({ lead_id: leadId, draft: draft, rationale: rationale });
 
+  // The eval bridge is read-only: return the proposal, then queue it through
+  // the normal HITL-gated draft_slack_followup tool.
   return { outcome: "drafted", lead_id: leadId, draft: draft, rationale: rationale,
            research: research, gong: gong, contact: lead.contact, company: company };
 })()'''
@@ -282,12 +283,24 @@ class GTMSimulator:
     def interpreter_outbound_script(
         self, lead_id: str, *, pinned: bool = False
     ) -> tuple[ScriptedModel, str, AIMessage]:
-        """Outbound follow-up as one JS program authored by the model."""
+        """Outbound follow-up as one read-only JS program plus a normal draft call."""
         _, outcome, final = self.outbound_script(lead_id, pinned=True)
         head = [] if pinned else [_read_skill("outbound-followup", "c1")]
         code = _INTERPRETER_OUTBOUND_JS.replace("__LEAD_ID__", lead_id)
-        script = _script(*head, _call("eval", {"code": code}, "c2"), final)
-        return script, outcome, final
+        turns = [*head, _call("eval", {"code": code}, "c2")]
+        if outcome == "drafted":
+            lead = tools._LEADS[lead_id]
+            research = tools._WEB_RESEARCH.get(lead["company"], "")
+            draft, rationale = self._draft_for(lead, research)
+            turns.append(
+                _call(
+                    "draft_slack_followup",
+                    {"lead_id": lead_id, "draft": draft, "rationale": rationale},
+                    "c3",
+                )
+            )
+        turns.append(final)
+        return _script(*turns), outcome, final
 
     def interpreter_intel_script(
         self, account: str, *, pinned: bool = False

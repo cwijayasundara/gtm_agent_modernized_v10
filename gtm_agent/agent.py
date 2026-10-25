@@ -101,15 +101,13 @@ Interpreter rules (overriding the turn-budget rules above):
 # (`globalThis.tools[<camelCase>] = ...; tools.<camelCase>(...)`).
 # Mirrors the full GTM tool surface used by the defined workflows in
 # ``gtm_agent.direct``.
-# Legacy fallback for callers that do not pass a skill. The skill-derived
-# path is read-only; this temporary list keeps the pre-update simulator green
-# until Task 9 moves the draft side effect out of eval.
+# Legacy fallback for callers that do not pass a skill. It is read-only;
+# action tools always stay on the normal HITL-gated tool path.
 DEFAULT_INTERPRETER_PTC: list[str] = [
     "lookup_lead",
     "check_contact_history",
     "get_gong_transcripts",
     "web_search_company",
-    "draft_slack_followup",
     "query_product_usage",
     "get_hiring_signals",
     "get_funding_news",
